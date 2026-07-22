@@ -27,7 +27,7 @@ class NotionClient:
                 "Notion-Version": NOTION_VERSION,
                 "Content-Type": "application/json",
             },
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0),
+            timeout=httpx.Timeout(5.0, connect=5.0, read=30.0, write=30.0),
             limits=httpx.Limits(max_keepalive_connections=10),
         )
 
