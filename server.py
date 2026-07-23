@@ -120,14 +120,20 @@ async def notion_append_to_page(page_id: str, markdown: str) -> dict:
 
 
 @mcp.tool()
-async def notion_update_block(block_id: str, markdown: str) -> dict:
+async def notion_update_block(block_id: str, markdown: str = "", blocks: Optional[list] = None) -> dict:
     """Update a Notion block's content from markdown.
     Works for: paragraph, heading_1/2/3, quote, bulleted/numbered list items,
-    to_do, toggle, callout, and code blocks."""
+    to_do, toggle, callout, and code blocks.
+
+    For complex block types (callout, toggle, table, column, synced_block),
+    pass raw block JSON via the 'blocks' parameter instead of markdown.
+    """
     _ensure_init()
     validation = validate_page_id(block_id)
     if validation:
         return validation
+    if blocks is not None:
+        return await _write_handler.update_block_raw(block_id, blocks)
     return await _write_handler.update_block(block_id, markdown)
 
 
