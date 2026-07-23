@@ -108,6 +108,39 @@ async def notion_inspect_database(database_id: str) -> dict:
     return result
 
 
+@mcp.tool()
+async def notion_append_to_page(page_id: str, markdown: str) -> dict:
+    """Append markdown content to an existing Notion page.
+    Supports: headings, bold, code, lists, tables, dividers, quotes, to-do."""
+    _ensure_init()
+    validation = validate_page_id(page_id)
+    if validation:
+        return validation
+    return await _write_handler.append_to_page(page_id, markdown)
+
+
+@mcp.tool()
+async def notion_update_block(block_id: str, markdown: str) -> dict:
+    """Update a Notion block's content from markdown.
+    Works for: paragraph, heading_1/2/3, quote, bulleted/numbered list items,
+    to_do, toggle, callout, and code blocks."""
+    _ensure_init()
+    validation = validate_page_id(block_id)
+    if validation:
+        return validation
+    return await _write_handler.update_block(block_id, markdown)
+
+
+@mcp.tool()
+async def notion_delete_block(block_id: str) -> dict:
+    """Delete a Notion block by ID. Removes the block and all its children."""
+    _ensure_init()
+    validation = validate_page_id(block_id)
+    if validation:
+        return validation
+    return await _write_handler.delete_block(block_id)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     mcp.run(transport="stdio")
