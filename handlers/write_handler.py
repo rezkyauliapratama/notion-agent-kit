@@ -93,3 +93,57 @@ class WriteHandler:
         except Exception as e:
             return {"error": True, "code": "APPEND_FAILED", "message": str(e)}
         return {"block_count": len(blocks), "batches": stats.get("batches", 1)}
+
+    async def append_to_page(self, page_id: str, markdown: str) -> dict:
+        """Append markdown content to an existing page."""
+        start_time = time.monotonic()
+        if not markdown or not markdown.strip():
+            return {"block_count": 0, "batches": 0, "duration_ms": 0}
+        try:
+            blocks = self.converter.convert(markdown)
+        except Exception as e:
+            return {"error": True, "code": "PARSE_FAILED", "message": f"Failed to parse markdown: {e}"}
+        if not blocks:
+            return {"block_count": 0, "batches": 0, "duration_ms": 0}
+        try:
+            stats = await self.batcher.append_blocks(page_id, blocks)
+        except Exception as e:
+            return {"error": True, "code": "APPEND_FAILED", "message": str(e)}
+        stats["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+        return {"block_count": len(blocks), **stats}
+
+    async def update_block(self, block_id: str, markdown: str) -> dict:
+        """Update a block's content from markdown. Works for: paragraph, heading_1-3, quote,
+        bulleted_list_item, numbered_list_item, to_do, toggle, callout, code."""
+        start_time = time.monotonic()
+        if not markdown or not markdown.strip():
+            return {"error": True, "code": "INVALID_INPUT", "message": "markdown content is required"}
+        try:
+            blocks = self.converter.convert(markdown)
+        except Exception as e:
+            return {"error": True, "code": "PARSE_FAILED", "message": f"Failed to parse markdown: {e}"}
+        if not blocks:
+            return {"error": True, "code": "PARSE_FAILED", "message": "Markdown produced no blocks"}
+        block_data = blocks[0]
+        block_type = block_data["type"]
+        content = {block_type: block_data[block_type]}
+        try:
+            result = await self.client.update_block(block_id, content)
+        except Exception as e:
+            return {"error": True, "code": "UPDATE_FAILED", "message": str(e)}
+        if result.get("error"):
+            return result
+        duration = int((time.monotonic() - start_time) * 1000)
+        return {"block_id": block_id, "type": block_type, "duration_ms": duration}
+
+    async def delete_block(self, block_id: str) -> dict:
+        """Delete a block by ID. Also removes all child blocks recursively."""
+        start_time = time.monotonic()
+        try:
+            result = await self.client.delete_block(block_id)
+        except Exception as e:
+            return {"error": True, "code": "DELETE_FAILED", "message": str(e)}
+        if result.get("error"):
+            return result
+        duration = int((time.monotonic() - start_time) * 1000)
+        return {"deleted": block_id, "duration_ms": duration}
