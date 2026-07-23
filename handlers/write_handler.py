@@ -136,6 +136,25 @@ class WriteHandler:
         duration = int((time.monotonic() - start_time) * 1000)
         return {"block_id": block_id, "type": block_type, "duration_ms": duration}
 
+    async def update_block_raw(self, block_id: str, block_data: List[Dict]) -> dict:
+        """Update a block using raw block JSON. Supports all block types including
+        callout, toggle, column, synced_block, table, and more."""
+        start_time = time.monotonic()
+        if not block_data:
+            return {"error": True, "code": "INVALID_INPUT", "message": "block_data is required"}
+        data = block_data[0] if isinstance(block_data, list) else block_data
+        block_type = data.get("type", "")
+        if not block_type:
+            return {"error": True, "code": "INVALID_INPUT", "message": "block_data must contain a 'type' field"}
+        try:
+            result = await self.client.update_block(block_id, data)
+        except Exception as e:
+            return {"error": True, "code": "UPDATE_FAILED", "message": str(e)}
+        if result.get("error"):
+            return result
+        duration = int((time.monotonic() - start_time) * 1000)
+        return {"block_id": block_id, "type": block_type, "duration_ms": duration}
+
     async def delete_block(self, block_id: str) -> dict:
         """Delete a block by ID. Also removes all child blocks recursively."""
         start_time = time.monotonic()
