@@ -187,16 +187,15 @@ class MarkdownConverter:
             best_match = None
             best_pattern = None
             for pattern_name, pattern in [
-                ("code", re.compile(r"^`([^`]+)`")),
-                ("bold", re.compile(r"^\*\*(.+?)\*\*")),
-                ("italic", re.compile(r"^\*(.+?)\*")),
-                ("link", re.compile(r"^\[(.+?)\]\((.+?)\)")),
+                ("code", re.compile(r"`([^`]+)`")),
+                ("bold", re.compile(r"\*\*(.+?)\*\*(?!\*)")),
+                ("italic", re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")),
+                ("link", re.compile(r"\[(.+?)\]\((.+?)\)")),
             ]:
-                match = pattern.match(remaining)
-                if match:
+                match = pattern.search(remaining)
+                if match and (best_match is None or match.start() < best_match.start()):
                     best_match = match
                     best_pattern = pattern_name
-                    break
             if best_match:
                 if best_match.start() > 0:
                     tokens.append(("text", remaining[:best_match.start()], None))
