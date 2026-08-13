@@ -49,7 +49,7 @@ def _ensure_init():
     _batcher = BlockBatcher(client=_client)
     _find_handler = FindHandler(client=_client)
     _read_handler = ReadHandler(client=_client, max_depth=2)
-    _write_handler = WriteHandler(client=_client, converter=_converter, batcher=_batcher)
+    _write_handler = WriteHandler(client=_client, converter=_converter, batcher=_batcher, cache=_cache)
 
 
 @mcp.tool()
@@ -106,6 +106,45 @@ async def notion_inspect_database(database_id: str) -> dict:
     if "error" not in result:
         _cache.set(database_id, result)
     return result
+
+
+@mcp.tool()
+async def notion_create_database(parent_page_id: str, title: str, properties: dict) -> dict:
+    """Create a new database (table) inside a page.
+
+    properties accepts two formats:
+    1. Simple: {"Amount": {"type": "number", "format": "idr"},
+                "Category": {"type": "select", "options": ["Food & Drinks", "Transport"]},
+                "Date": {"type": "date"}}
+    2. Raw Notion API format: {"Amount": {"number": {"format": "idr"}}}
+
+    Supported simple types: title, rich_text, number (format: number/idr/usd),
+    select, multi_select, status, date, checkbox, url, email, phone_number.
+    """
+    _ensure_init()
+    validation = validate_page_id(parent_page_id)
+    if validation:
+        return validation
+    return await _write_handler.create_database(parent_page_id, title, properties)
+
+
+@mcp.tool()
+async def notion_add_database_row(database_id: str, properties: dict) -> dict:
+    """Add a row (page) to an existing database.
+
+    Values are auto-converted to Notion API format based on the database
+    schema. Example for a spending tracker:
+      properties={"Description": "Kopi", "Amount": 10000,
+                  "Date": "2026-08-13", "Category": "Food & Drinks"}
+
+    If the schema is unknown for a property, falls back to type heuristics
+    (str -> rich_text, int/float -> number, bool -> checkbox, list -> multi_select).
+    """
+    _ensure_init()
+    validation = validate_page_id(database_id)
+    if validation:
+        return validation
+    return await _write_handler.add_database_row(database_id, properties)
 
 
 @mcp.tool()
