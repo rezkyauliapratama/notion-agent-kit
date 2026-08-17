@@ -3,10 +3,10 @@
 ## Enterprise MCP Server Specification
 
 Document ID: BS-ARCH-MCP-001
-Version: 1.0
+Version: 1.1
 Classification: Internal - Architecture & Engineering
 Author: Hermes Agent - Rezky Aulia Pratama
-Date: 2026-07-22
+Date: 2026-07-22 (v1.0) / 2026-08-17 (v1.1)
 Status: Draft for Review
 
 ---
@@ -118,6 +118,54 @@ Inspect a Notion database schema.
 
 Input: `database_id`
 Output: `{ id, title, properties: [{ name, type, options? }], data_source_id }`
+
+### notion_create_database
+
+Create a database (table) inside a page. Simple schema format
+(`{"Amount": {"type": "number", "format": "idr"}}`) or raw Notion API format.
+Auto-adds a `Name` title property when the caller omits one (Notion requires
+exactly one title property per database).
+
+Input: `parent_page_id`, `title`, `properties`
+Output: `{ database_id, url, title, properties }`
+
+### notion_add_database_row
+
+Add a row (page) to an existing database. Values are converted to Notion API
+format from the database's schema (fetched + cached). Schema is normalized to
+a `{name: {type: ...}}` dict regardless of cache format (dict from
+retrieve_database or list from inspect_database).
+
+Input: `database_id`, `properties`
+Output: `{ page_id, url, properties }`
+
+### notion_append_to_page
+
+Append markdown content (headings, bold, code, lists, tables, dividers,
+quotes, to-do) to an existing page. Batches at 100 blocks.
+
+Input: `page_id`, `markdown`
+Output: `{ block_count, batches, duration_ms }`
+
+### notion_update_block
+
+Update ONE block's content from markdown. The existing block type is fetched
+first: plain-text markdown auto-maps onto heading/quote/list types; any other
+type change returns `BLOCK_TYPE_MISMATCH` (Notion does not support type
+changes). Multi-block markdown returns `TOO_MANY_BLOCKS`. Raw JSON via
+`blocks` parameter for complex types.
+
+Input: `block_id`, `markdown` | `blocks`
+Output: `{ block_id, type, duration_ms }`
+
+### notion_delete_block
+
+Delete a block and all children. Idempotent: already-deleted blocks return
+`{ deleted, already_deleted: true }` instead of an error (observed in
+production cleanup scripts).
+
+Input: `block_id`
+Output: `{ deleted, duration_ms }`
 
 ## 4. Block Type Support
 

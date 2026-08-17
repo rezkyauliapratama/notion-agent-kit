@@ -6,6 +6,9 @@ from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Notion hard limit: 2000 chars per rich_text element. Split longer content.
+RICH_TEXT_MAX = 2000
+
 
 class MarkdownConverter:
     """Convert markdown text to Notion block JSON."""
@@ -122,7 +125,7 @@ class MarkdownConverter:
         if i >= len(lines):
             return [], i
         header_line = lines[i].strip()
-        headers = [h.strip() for h in header_line.split("|") if h.strip()]
+        headers = self._split_table_row(header_line)
         if not headers:
             return [], i + 1
         num_columns = len(headers)
@@ -137,13 +140,28 @@ class MarkdownConverter:
             stripped = lines[i].strip()
             if not stripped.startswith("|"):
                 break
-            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            cells = self._split_table_row(stripped)
             while len(cells) < num_columns:
                 cells.append("")
             cells = cells[:num_columns]
             table["table"]["children"].append(self._build_table_row(cells, bold=False))
             i += 1
         return [table], i
+
+    @staticmethod
+    def _split_table_row(line: str) -> List[str]:
+        """Split a markdown table row preserving empty-cell positions.
+
+        Naive split + filter corrupts columns when a middle cell is empty
+        (e.g. '| a |  | c |' -> ['a', '', 'c'] must stay 3 columns).
+        Only the leading/trailing empties produced by the outer pipes are dropped.
+        """
+        parts = line.split("|")
+        if parts and parts[0] == "":
+            parts = parts[1:]
+        if parts and parts[-1] == "":
+            parts = parts[:-1]
+        return [p.strip() for p in parts]
 
     def _build_table_row(self, cells: List[str], bold: bool = False) -> Dict:
         notion_cells = []
@@ -156,7 +174,11 @@ class MarkdownConverter:
         return {"type": "table_row", "table_row": {"cells": notion_cells}}
 
     def _build_code_block(self, code: str, language: str) -> Dict:
-        return {"type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": code}}], "language": language}}
+        # Notion limits each rich_text element to 2000 chars; a code block
+        # accepts up to 100 rich_text elements. Split long code accordingly.
+        chunks = [code[i:i + RICH_TEXT_MAX] for i in range(0, len(code), RICH_TEXT_MAX)] or [""]
+        rich_text = [{"type": "text", "text": {"content": chunk}} for chunk in chunks]
+        return {"type": "code", "code": {"rich_text": rich_text, "language": language}}
 
     def _parse_inline_formatting(self, text: str) -> List[Dict]:
         if not text:
@@ -178,7 +200,35 @@ class MarkdownConverter:
             elif token_type == "link" and link_url:
                 base["text"]["link"] = {"url": link_url}
             rich_texts.append(base)
-        return rich_texts
+        return self._split_long_rich_text(rich_texts)
+
+    @staticmethod
+    def _split_long_rich_text(rich_texts: List[Dict]) -> List[Dict]:
+        """Split rich_text elements longer than 2000 chars (Notion hard limit).
+
+        Each resulting element keeps its annotations/link. Notion allows up to
+        100 rich_text elements per block, so a 200K-char paragraph would need
+        manual chunking at the block level - but 2000-char splits cover every
+        realistic agent document without API 400s.
+        """
+        split = []
+        for rt in rich_texts:
+            content = rt["text"]["content"]
+            if len(content) <= RICH_TEXT_MAX:
+                split.append(rt)
+                continue
+            link = rt["text"].get("link")
+            for i in range(0, len(content), RICH_TEXT_MAX):
+                chunk = content[i:i + RICH_TEXT_MAX]
+                new_rt = {
+                    "type": "text",
+                    "text": {"content": chunk},
+                    "annotations": dict(rt["annotations"]),
+                }
+                if link:
+                    new_rt["text"]["link"] = link
+                split.append(new_rt)
+        return split
 
     def _tokenize(self, text: str) -> List[Tuple[str, str, Optional[str]]]:
         tokens = []

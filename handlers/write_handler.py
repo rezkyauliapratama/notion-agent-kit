@@ -42,6 +42,10 @@ class WriteHandler:
             api_props = self._build_database_properties(properties)
         except ValueError as e:
             return {"error": True, "code": "INVALID_INPUT", "message": str(e)}
+        # Notion requires exactly one title property in every database.
+        # Auto-add a default one so callers that forget it don't get a 400.
+        if not any(isinstance(v, dict) and "title" in v for v in api_props.values()):
+            api_props["Name"] = {"title": {}}
         parent = {"type": "page_id", "page_id": parent_page_id}
         try:
             result = await self.client.create_database(parent, title, api_props)
@@ -95,7 +99,7 @@ class WriteHandler:
         if self.cache:
             cached = self.cache.get(database_id)
             if cached:
-                return cached.get("properties", {})
+                return self._normalize_schema(cached.get("properties", {}))
         try:
             result = await self.client.retrieve_database(database_id)
         except Exception as e:
@@ -104,7 +108,35 @@ class WriteHandler:
             return result
         if self.cache:
             self.cache.set(database_id, result)
-        return result.get("properties", {})
+        return self._normalize_schema(result.get("properties", {}))
+
+    @staticmethod
+    def _normalize_schema(properties) -> dict:
+        """Normalize a database schema to {name: {type: ...}}.
+
+        Fixes a real production bug: the schema cache is shared between
+        notion_inspect_database (which stores properties as a LIST of
+        {name, type, options}) and notion_add_database_row (which expects a
+        DICT keyed by property name). The cached list crashed
+        add_database_row with "'list' object has no attribute 'get'".
+        """
+        if isinstance(properties, dict):
+            return properties
+        if isinstance(properties, list):
+            normalized = {}
+            for entry in properties:
+                if not isinstance(entry, dict) or not entry.get("name"):
+                    continue
+                name = entry["name"]
+                spec = {"type": entry.get("type", "rich_text")}
+                options = entry.get("options")
+                if options is not None:
+                    spec["options"] = [
+                        o.get("name") if isinstance(o, dict) else o for o in options
+                    ]
+                normalized[name] = spec
+            return normalized
+        return {}
 
     @staticmethod
     def _build_database_properties(properties: dict) -> dict:
@@ -151,6 +183,8 @@ class WriteHandler:
     @staticmethod
     def _convert_row_properties(schema: dict, values: dict) -> dict:
         """Convert plain values to Notion API format based on schema types."""
+        if not isinstance(schema, dict):
+            schema = WriteHandler._normalize_schema(schema)
         converted = {}
         for name, value in values.items():
             prop_spec = schema.get(name, {})
@@ -300,9 +334,39 @@ class WriteHandler:
             return {"error": True, "code": "PARSE_FAILED", "message": f"Failed to parse markdown: {e}"}
         if not blocks:
             return {"error": True, "code": "PARSE_FAILED", "message": "Markdown produced no blocks"}
+        if len(blocks) > 1:
+            return {"error": True, "code": "TOO_MANY_BLOCKS",
+                    "message": f"Markdown produced {len(blocks)} blocks but notion_update_block updates exactly ONE block. "
+                               "Pass a single paragraph/heading/list line, or use notion_append_to_page / notion_write_blocks for multi-block content."}
         block_data = blocks[0]
         block_type = block_data["type"]
         content = {block_type: block_data[block_type]}
+        # Notion cannot change a block's type. Fetch the existing block first;
+        # if the markdown would change its type, either auto-map plain text onto
+        # the existing type (heading/quote/list) or fail with a clear error.
+        try:
+            existing = await self.client.retrieve_block(block_id)
+        except Exception as e:
+            return {"error": True, "code": "FETCH_FAILED", "message": str(e)}
+        if existing.get("error"):
+            return existing
+        existing_type = existing.get("type", "")
+        if existing_type and existing_type != block_type:
+            if block_type == "paragraph" and existing_type in (
+                "heading_1", "heading_2", "heading_3", "quote",
+                "bulleted_list_item", "numbered_list_item", "to_do",
+                "toggle", "callout",
+            ):
+                rich_text = block_data["paragraph"]["rich_text"]
+                content = {existing_type: {"rich_text": rich_text}}
+                if existing_type == "to_do":
+                    content["to_do"]["checked"] = existing.get("to_do", {}).get("checked", False)
+                block_type = existing_type
+            else:
+                return {"error": True, "code": "BLOCK_TYPE_MISMATCH",
+                        "message": f"Cannot update block: existing type is '{existing_type}' but markdown converts to '{block_type}'. "
+                                   "Notion does not support changing a block's type. Delete + recreate the block, or "
+                                   "write markdown that matches the existing type."}
         try:
             result = await self.client.update_block(block_id, content)
         except Exception as e:
@@ -332,13 +396,19 @@ class WriteHandler:
         return {"block_id": block_id, "type": block_type, "duration_ms": duration}
 
     async def delete_block(self, block_id: str) -> dict:
-        """Delete a block by ID. Also removes all child blocks recursively."""
+        """Delete a block by ID. Also removes all child blocks recursively.
+
+        Idempotent: deleting an already-deleted block returns success with
+        already_deleted=True instead of an error (observed in production:
+        cleanup scripts re-delete blocks and got 404 spam)."""
         start_time = time.monotonic()
         try:
             result = await self.client.delete_block(block_id)
         except Exception as e:
             return {"error": True, "code": "DELETE_FAILED", "message": str(e)}
         if result.get("error"):
+            if result.get("code") == "NOT_FOUND":
+                return {"deleted": block_id, "already_deleted": True, "duration_ms": 0}
             return result
         duration = int((time.monotonic() - start_time) * 1000)
         return {"deleted": block_id, "duration_ms": duration}
