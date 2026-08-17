@@ -107,6 +107,14 @@ class NotionClient:
             body["children"] = children
         return await self._request("POST", "pages", json=body)
 
+    async def create_database(self, parent: dict, title: str, properties: dict) -> dict:
+        body = {
+            "parent": parent,
+            "title": [{"type": "text", "text": {"content": title}}],
+            "properties": properties,
+        }
+        return await self._request("POST", "databases", json=body)
+
     async def append_block_children(self, block_id: str, children: list) -> dict:
         return await self._request("PATCH", f"blocks/{block_id}/children", json={"children": children})
 
