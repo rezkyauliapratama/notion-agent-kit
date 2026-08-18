@@ -12,6 +12,7 @@ from core.schema_cache import SchemaCache
 from core.block_converter import MarkdownConverter
 from core.block_batcher import BlockBatcher
 from handlers.find_handler import FindHandler
+from handlers.query_handler import QueryHandler
 from handlers.read_handler import ReadHandler
 from handlers.write_handler import WriteHandler
 from handlers.validate import extract_page_id
@@ -27,12 +28,13 @@ _cache: Optional[SchemaCache] = None
 _converter: Optional[MarkdownConverter] = None
 _batcher: Optional[BlockBatcher] = None
 _find_handler: Optional[FindHandler] = None
+_query_handler: Optional[QueryHandler] = None
 _read_handler: Optional[ReadHandler] = None
 _write_handler: Optional[WriteHandler] = None
 
 
 def _ensure_init():
-    global _client, _cache, _converter, _batcher, _find_handler, _read_handler, _write_handler
+    global _client, _cache, _converter, _batcher, _find_handler, _query_handler, _read_handler, _write_handler
     if _client is not None:
         return
 
@@ -48,6 +50,7 @@ def _ensure_init():
     _converter = MarkdownConverter()
     _batcher = BlockBatcher(client=_client)
     _find_handler = FindHandler(client=_client)
+    _query_handler = QueryHandler(client=_client)
     _read_handler = ReadHandler(client=_client, max_depth=2)
     _write_handler = WriteHandler(client=_client, converter=_converter, batcher=_batcher, cache=_cache)
 
@@ -122,6 +125,28 @@ async def notion_inspect_database(database_id: str) -> dict:
     if "error" not in result:
         _cache.set(database_id, result)
     return result
+
+
+@mcp.tool()
+async def notion_query_database(database_id: str, page_size: int = 50,
+                                filter_obj: Optional[dict] = None,
+                                sorts: Optional[list] = None) -> dict:
+    """Query a Notion database and list its rows (pages) with parsed property values.
+
+    Returns each row as: id, url, created, last_edited, and properties (all
+    properties parsed to plain values - title/rich_text as str, select/status
+    as option name, date as {start,end}, checkbox as bool, etc).
+
+    Pagination: if the database has more rows than page_size, returns
+    has_more=true and next_cursor; call again to page through. Filter/sorts
+    use the raw Notion API filter/sort syntax if provided.
+    """
+    _ensure_init()
+    database_id, err = _resolve_page_id(database_id)
+    if err:
+        return err
+    assert database_id is not None
+    return await _query_handler.query_database(database_id, filter_obj, sorts, page_size)
 
 
 @mcp.tool()
