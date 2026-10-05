@@ -92,12 +92,15 @@ class NotionClient:
         return await self._request("GET", f"databases/{database_id}")
 
     async def query_database(self, database_id: str, filter_obj: Optional[dict] = None,
-                              sorts: Optional[list] = None, page_size: int = 100) -> dict:
-        body = {"page_size": min(page_size, 100)}
+                              sorts: Optional[list] = None, page_size: int = 100,
+                              start_cursor: Optional[str] = None) -> dict:
+        body: dict = {"page_size": min(page_size, 100)}
         if filter_obj:
             body["filter"] = filter_obj
         if sorts:
             body["sorts"] = sorts
+        if start_cursor:
+            body["start_cursor"] = start_cursor
         return await self._request("POST", f"databases/{database_id}/query", json=body)
 
     # --- Write ---
@@ -115,8 +118,22 @@ class NotionClient:
         }
         return await self._request("POST", "databases", json=body)
 
-    async def append_block_children(self, block_id: str, children: list) -> dict:
-        return await self._request("PATCH", f"blocks/{block_id}/children", json={"children": children})
+    async def append_block_children(self, block_id: str, children: list,
+                                    after: Optional[str] = None) -> dict:
+        """Append children to a block/page.
+
+        IMPORTANT (production rule 1): appending uses PATCH /v1/blocks/{id}/children.
+        POST is answered with a misleading 400 "invalid_request_url". Do not
+        change this verb.
+
+        `after` is a sibling block ID; when set, Notion inserts the children
+        immediately after it. The block is forwarded as-is (the API validates
+        that `after` shares the same parent as `block_id`).
+        """
+        body: dict = {"children": children}
+        if after:
+            body["after"] = after
+        return await self._request("PATCH", f"blocks/{block_id}/children", json=body)
 
     async def update_block(self, block_id: str, block_data: dict) -> dict:
         return await self._request("PATCH", f"blocks/{block_id}", json=block_data)
@@ -126,6 +143,32 @@ class NotionClient:
 
     async def delete_block(self, block_id: str) -> dict:
         return await self._request("DELETE", f"blocks/{block_id}")
+
+    async def archive_page(self, object_id: str, archived: bool,
+                           object_type: str = "auto") -> dict:
+        """Archive or restore a page or database.
+
+        Pages and databases live on different endpoints. With object_type
+        "auto" the pages endpoint is tried first; a 404 (the ID is actually a
+        database) falls back to the databases endpoint. Idempotent: re-archiving
+        an already-archived object returns 200 from Notion.
+        """
+        error: dict
+        if object_type in ("page", "auto"):
+            result = await self._request("PATCH", f"pages/{object_id}",
+                                         json={"archived": archived})
+            if not result.get("error"):
+                return result
+            if object_type == "page" or result.get("code") != "NOT_FOUND":
+                return result
+            error = result
+        else:
+            error = {"error": True, "code": "INVALID_INPUT",
+                     "message": f"object_type must be 'page', 'database' or 'auto', got '{object_type}'"}
+        if object_type in ("database", "auto"):
+            return await self._request("PATCH", f"databases/{object_id}",
+                                       json={"archived": archived})
+        return error
 
     # --- Comments ---
     async def retrieve_comments(self, block_id: str, page_size: int = 100) -> dict:
