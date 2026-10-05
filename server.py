@@ -101,14 +101,27 @@ async def notion_write_document(parent_page_id: str, title: str, markdown: str,
 
 
 @mcp.tool()
-async def notion_write_blocks(parent_block_id: str, blocks: list) -> dict:
+async def notion_write_blocks(parent_block_id: str, blocks: list,
+                              after: Optional[str] = None) -> dict:
     """Write raw Notion block JSON to a page.
-    For block types not supported by markdown (callout, toggle, column, etc.)."""
+    For block types not supported by markdown (callout, toggle, column, etc.).
+
+    Optional `after` (a sibling block ID) inserts the blocks immediately after
+    that block. The block must share the append target's parent; a local guard
+    returns INVALID_INPUT (parent mismatch) or NOT_FOUND (block missing).
+    Tables must ship with their rows inline under the 'table' object's children,
+    otherwise INVALID_INPUT is returned before the request is sent.
+    The result includes `verified` (read-back signature match) when the write
+    fits in a single batch."""
     _ensure_init()
     parent_block_id, err = _resolve_page_id(parent_block_id)
     if err:
         return err
-    return await _write_handler.write_blocks(parent_block_id, blocks)
+    if after:
+        after, err = _resolve_page_id(after)
+        if err:
+            return err
+    return await _write_handler.write_blocks(parent_block_id, blocks, after=after)
 
 
 @mcp.tool()
@@ -130,23 +143,34 @@ async def notion_inspect_database(database_id: str) -> dict:
 @mcp.tool()
 async def notion_query_database(database_id: str, page_size: int = 50,
                                 filter_obj: Optional[dict] = None,
-                                sorts: Optional[list] = None) -> dict:
+                                sorts: Optional[list] = None,
+                                start_cursor: Optional[str] = None,
+                                fetch_all: bool = False,
+                                max_rows: int = 500) -> dict:
     """Query a Notion database and list its rows (pages) with parsed property values.
 
     Returns each row as: id, url, created, last_edited, and properties (all
     properties parsed to plain values - title/rich_text as str, select/status
     as option name, date as {start,end}, checkbox as bool, etc).
 
-    Pagination: if the database has more rows than page_size, returns
-    has_more=true and next_cursor; call again to page through. Filter/sorts
-    use the raw Notion API filter/sort syntax if provided.
+    Pagination:
+    - Default: one request, page_size capped at 100. If more rows exist,
+      returns has_more=true and next_cursor.
+    - start_cursor: continue from a cursor returned by a previous call.
+    - fetch_all=true: automatically follow next_cursor until the database is
+      exhausted or max_rows (default 500, max 2000) is reached. Returns the
+      combined rows plus has_more, next_cursor, total and pages_fetched.
+
+    Filter/sorts use the raw Notion API filter/sort syntax if provided.
     """
     _ensure_init()
     database_id, err = _resolve_page_id(database_id)
     if err:
         return err
     assert database_id is not None
-    return await _query_handler.query_database(database_id, filter_obj, sorts, page_size)
+    return await _query_handler.query_database(
+        database_id, filter_obj, sorts, page_size,
+        start_cursor=start_cursor, fetch_all=fetch_all, max_rows=max_rows)
 
 
 @mcp.tool()
@@ -154,13 +178,19 @@ async def notion_create_database(parent_page_id: str, title: str, properties: di
     """Create a new database (table) inside a page.
 
     properties accepts two formats:
-    1. Simple: {"Amount": {"type": "number", "format": "idr"},
+    1. Simple: {"Amount": {"type": "number", "format": "rupiah"},
                 "Category": {"type": "select", "options": ["Food & Drinks", "Transport"]},
                 "Date": {"type": "date"}}
-    2. Raw Notion API format: {"Amount": {"number": {"format": "idr"}}}
+    2. Raw Notion API format: {"Amount": {"number": {"format": "rupiah"}}}
 
-    Supported simple types: title, rich_text, number (format: number/idr/usd),
-    select, multi_select, status, date, checkbox, url, email, phone_number.
+    Supported simple types: title, rich_text, number, select, multi_select,
+    status, date, checkbox, url, email, phone_number.
+    Number format: any Notion format name (e.g. number, rupiah, dollar, euro).
+    Common currency aliases are accepted too and normalized (idr->rupiah,
+    usd->dollar, eur->euro, gbp->pound, jpy->yen, sgd->singapore_dollar,
+    myr->ringgit, aud->australian_dollar, cad->canadian_dollar, chf->franc,
+    cny->yuan, krw->won, inr->rupee, thb->baht). Unknown formats return
+    INVALID_INPUT.
     A default 'Name' title property is added automatically when none is provided.
     """
     _ensure_init()
@@ -181,6 +211,12 @@ async def notion_add_database_row(database_id: str, properties: dict) -> dict:
 
     If the schema is unknown for a property, falls back to type heuristics
     (str -> rich_text, int/float -> number, bool -> checkbox, list -> multi_select).
+
+    Supported property types: title, rich_text, number, select, status,
+    multi_select, date (plain string or {"start","end","time_zone"}), checkbox,
+    url, email, phone_number, relation (an ID string or a list of IDs /
+    {"id": ...} objects). Read-only types (formula, rollup, created_time,
+    created_by, last_edited_time, last_edited_by, unique_id) return INVALID_INPUT.
     """
     _ensure_init()
     database_id, err = _resolve_page_id(database_id)
@@ -190,14 +226,24 @@ async def notion_add_database_row(database_id: str, properties: dict) -> dict:
 
 
 @mcp.tool()
-async def notion_append_to_page(page_id: str, markdown: str) -> dict:
+async def notion_append_to_page(page_id: str, markdown: str,
+                                after: Optional[str] = None) -> dict:
     """Append markdown content to an existing Notion page.
-    Supports: headings, bold, code, lists, tables, dividers, quotes, to-do."""
+    Supports: headings, bold, code, lists, tables, dividers, quotes, to-do.
+
+    Optional `after` (a sibling block ID) inserts the new blocks immediately
+    after that block (must be a direct child of the page; INVALID_INPUT /
+    NOT_FOUND otherwise). The result includes `verified` (read-back signature
+    match) when the write fits in a single batch."""
     _ensure_init()
     page_id, err = _resolve_page_id(page_id)
     if err:
         return err
-    return await _write_handler.append_to_page(page_id, markdown)
+    if after:
+        after, err = _resolve_page_id(after)
+        if err:
+            return err
+    return await _write_handler.append_to_page(page_id, markdown, after=after)
 
 
 @mcp.tool()
@@ -229,6 +275,99 @@ async def notion_delete_block(block_id: str) -> dict:
     if err:
         return err
     return await _write_handler.delete_block(block_id)
+
+
+@mcp.tool()
+async def notion_update_page_properties(page_id: str, properties: dict) -> dict:
+    """Update properties on an existing page (not a database row).
+
+    The page is fetched first to learn each property's type, then plain values
+    are converted with the same rules as notion_add_database_row. Supported
+    types: title, rich_text, number, select, status, multi_select, date
+    (including ranges as {"start": ..., "end": ...}), checkbox, url, email,
+    phone_number, relation. Values already in raw Notion API form
+    ({"rich_text": [...]} etc.) are passed through unchanged.
+
+    Example: properties={"Status": "Done", "Due": {"start": "2026-10-01", "end": "2026-10-07"}}
+
+    Unknown property names return INVALID_INPUT listing the properties that
+    exist on the page.
+    """
+    _ensure_init()
+    page_id, err = _resolve_page_id(page_id)
+    if err:
+        return err
+    return await _write_handler.update_page_properties(page_id, properties)
+
+
+@mcp.tool()
+async def notion_archive_page(page_id: str, restore: bool = False,
+                              object_type: str = "auto") -> dict:
+    """Archive a page or database (or restore it with restore=true).
+
+    Idempotent: archiving an already-archived object still succeeds. With
+    object_type="auto" (default) a page is tried first and a database is used
+    as fallback; pass "page" or "database" to force one. Output:
+    {"object": "page"|"database", "id": ..., "archived": true|false}.
+    """
+    _ensure_init()
+    page_id, err = _resolve_page_id(page_id)
+    if err:
+        return err
+    return await _write_handler.archive_page(page_id, restore=restore,
+                                             object_type=object_type)
+
+
+@mcp.tool()
+async def notion_duplicate_page(page_id: str, title: Optional[str] = None) -> dict:
+    """Duplicate a Notion page (content tree + copyable properties).
+
+    Reads the source page's full block tree (pagination + depth), creates a
+    page under the same parent, and appends the blocks in order (tables ship
+    with their rows inline). The result is verified by reading back and
+    comparing block signatures. `title` overrides the page title; when omitted
+    the source title is copied with a ' (copy)' suffix. Read-only properties
+    (formula, rollup, created_time, ...) are skipped.
+
+    Output: {page_id, url, blocks_copied, verified, ...}. On a signature
+    mismatch `verified` is false with an `explain`; the created page is kept."""
+    _ensure_init()
+    page_id, err = _resolve_page_id(page_id)
+    if err:
+        return err
+    return await _write_handler.duplicate_page(page_id, title=title)
+
+
+@mcp.tool()
+async def notion_update_table_row(table_row_block_id: str, cells: list) -> dict:
+    """Update a table row's cells, preserving existing cell annotations.
+
+    `cells` is a list of cells (one per column). Each cell may be a plain
+    string (keeps the old cell's annotations), a dict
+    {"text": ..., "annotations": {...}} (explicit annotations), or a full
+    rich_text list. The block must be a table_row; otherwise BLOCK_TYPE_MISMATCH.
+    Output: {block_id, type: "table_row", cells, duration_ms}."""
+    _ensure_init()
+    table_row_block_id, err = _resolve_page_id(table_row_block_id)
+    if err:
+        return err
+    return await _write_handler.update_table_row(table_row_block_id, cells)
+
+
+@mcp.tool()
+async def notion_replace_table(table_block_id: str, rows: list) -> dict:
+    """Replace a table, allowing a different column count.
+
+    Notion cannot change a table's width in place: a new table is created with
+    its rows inline immediately after the old one, then the old table is
+    deleted. `rows` is a list of rows; each row is a list of cells (string,
+    {"text","annotations"} dict, or rich_text list). All rows must have the same
+    column count. Output: {old_table_id, new_table_id, rows, columns}."""
+    _ensure_init()
+    table_block_id, err = _resolve_page_id(table_block_id)
+    if err:
+        return err
+    return await _write_handler.replace_table(table_block_id, rows)
 
 
 def main():
