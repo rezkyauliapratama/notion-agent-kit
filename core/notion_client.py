@@ -22,10 +22,12 @@ class NotionClient:
         self.rate_limiter = RateLimiter(max_rps=3)
         self._client = httpx.AsyncClient(
             base_url=NOTION_API_BASE,
+            # Let httpx select the JSON content type for ``json=`` requests
+            # and generate a boundary for multipart ``files=`` requests. A
+            # client-wide Content-Type would incorrectly label uploads as JSON.
             headers={
                 "Authorization": f"Bearer {token}",
                 "Notion-Version": NOTION_VERSION,
-                "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(5.0, connect=5.0, read=30.0, write=30.0),
             limits=httpx.Limits(max_keepalive_connections=10),
@@ -38,6 +40,16 @@ class NotionClient:
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         await self.rate_limiter.acquire()
         try:
+            files = kwargs.get("files")
+            if isinstance(files, dict):
+                # ``_request`` is retried by ``with_retry``. Rewind file
+                # handles before each attempt so a timeout does not retry with
+                # an exhausted multipart stream.
+                for file_spec in files.values():
+                    if isinstance(file_spec, tuple) and len(file_spec) > 1:
+                        file_handle = file_spec[1]
+                        if hasattr(file_handle, "seek"):
+                            file_handle.seek(0)
             response = await self._client.request(method, path, **kwargs)
             return await self._handle_response(response)
         except httpx.TimeoutException:
@@ -103,6 +115,20 @@ class NotionClient:
             body["start_cursor"] = start_cursor
         return await self._request("POST", f"databases/{database_id}/query", json=body)
 
+    # --- Users ---
+    async def retrieve_user(self, user_id: str) -> dict:
+        return await self._request("GET", f"users/{user_id}")
+
+    async def list_users(self, page_size: int = 100,
+                         start_cursor: Optional[str] = None) -> dict:
+        params: dict = {"page_size": min(page_size, 100)}
+        if start_cursor is not None:
+            params["start_cursor"] = start_cursor
+        return await self._request("GET", "users", params=params)
+
+    async def get_self(self) -> dict:
+        return await self._request("GET", "users/me")
+
     # --- Write ---
     async def create_page(self, parent: dict, properties: dict, children: Optional[list] = None) -> dict:
         body = {"parent": parent, "properties": properties}
@@ -141,9 +167,47 @@ class NotionClient:
     async def update_page_properties(self, page_id: str, properties: dict) -> dict:
         return await self._request("PATCH", f"pages/{page_id}", json={"properties": properties})
 
+    async def move_page(self, page_id: str, parent_page_id: str) -> dict:
+        """Move a page beneath another page using Notion's move endpoint."""
+        return await self._request(
+            "POST", f"pages/{page_id}/move",
+            json={"parent": {"page_id": parent_page_id}},
+        )
+
+    # --- File uploads ---
+    async def create_file_upload(self, filename: str, content_type: str) -> dict:
+        """Create a single-part file upload reservation.
+
+        ``mode`` is explicit so this path never accidentally creates a
+        multi-part upload that this client cannot complete.
+        """
+        return await self._request(
+            "POST", "file_uploads",
+            json={
+                "mode": "single_part",
+                "filename": filename,
+                "content_type": content_type,
+            },
+        )
+
+    async def send_file_upload(self, file_upload_id: str, file_path,
+                               filename: str, content_type: str) -> dict:
+        """Send one local file as the upload's multipart ``file`` field.
+
+        The file handle stays open only for the request and is always closed,
+        including when httpx or the API raises. ``part_number`` is deliberately
+        omitted because this is the single-part flow.
+        """
+        with open(file_path, "rb") as file_handle:
+            return await self._request(
+                "POST", f"file_uploads/{file_upload_id}/send",
+                files={"file": (filename, file_handle, content_type)},
+            )
+
     async def delete_block(self, block_id: str) -> dict:
         return await self._request("DELETE", f"blocks/{block_id}")
 
+    # --- Archive ---
     async def archive_page(self, object_id: str, archived: bool,
                            object_type: str = "auto") -> dict:
         """Archive or restore a page or database.

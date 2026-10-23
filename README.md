@@ -16,12 +16,19 @@ Run the test suite:
 python -m unittest discover -s tests -v
 ```
 
-## Tools (16)
+## Tools (24)
 
 | Tool | Description |
 |------|-------------|
 | `notion_find` | Search pages/databases by title (`query`, `object_type`, `page_size`) |
 | `notion_read_page` | Read page content + metadata (`page_id`, `max_blocks` default 200, `depth`). Returns `has_more` when truncated — re-call with larger `max_blocks` (max 1000) to page through |
+| `notion_get_self` | Retrieve the user associated with the configured token. Returns allowlisted profile and bot workspace fields only; no token or raw credentials |
+| `notion_get_user` | Retrieve a workspace user, guest, or bot by `user_id` UUID (dashed or 32 hex only; page URLs are rejected) |
+| `notion_get_users` | List one page of workspace users (`page_size` 1–100, `start_cursor`); preserves `results`, `has_more`, and `next_cursor` |
+| `notion_get_block_download_urls` | Get a fresh direct URL for an `image`, `file`, `video`, `pdf`, or `audio` block (`block_id`). Returns `urls: [{url, source, expiry_time?}]`; Notion-hosted `file` URLs are signed and should be refreshed after expiry |
+| `notion_upload_file` | Upload one local file (single-part, max 20 MiB) and attach it to a page/block as a `file_upload` media block (`file_path`, `target_id`, optional `target_type` and `mime_type`) |
+| `notion_create_comment` | Create a plain-text comment (`text`) on exactly one target: `page_id`, `block_id`, or `discussion_id` to reply to a thread |
+| `notion_get_comments` | List comments attached to a page or block (`block_id`, `page_size` 1–100); returns `comments`, `has_more`, and `next_cursor` |
 | `notion_write_document` | Write a full document from markdown into a new page (headings, bold, code, lists, tables, dividers, quotes, to-do) |
 | `notion_write_blocks` | Write raw Notion block JSON (callout, toggle, column, synced_block, ...). Optional `after` inserts after a sibling block. Tables must ship with rows inline |
 | `notion_inspect_database` | Inspect database schema (properties, types, options) |
@@ -35,14 +42,19 @@ python -m unittest discover -s tests -v
 | `notion_duplicate_page` | Duplicate a page (`page_id`, optional `title`): copies the full block tree (pagination + depth) and writable properties, then verifies by read-back signature. Output `{page_id, url, blocks_copied, verified}` |
 | `notion_update_page_properties` | Update typed properties on an existing page (`properties`). Fetches the page to learn each property's type, then converts with the same rules as `notion_add_database_row` |
 | `notion_archive_page` | Archive/restore a page or database (`restore`, `object_type` auto/page/database). Idempotent |
+| `notion_move_page` | Move a page under another page (`page_id`, `parent_page_id`); uses page-parent semantics only and returns `{page_id, parent, response}` |
 | `notion_query_database` | Query a database. Pagination params: `start_cursor`, `fetch_all` (follows cursors), `max_rows` (default 500, max 2000) |
 
 ## Accepted ID formats
 
-All `*_id` parameters accept:
+Page, database, and block-oriented `*_id` parameters accept:
 - UUID with dashes: `3aa0f42d-7035-802b-bf61-e7effd583a39`
 - 32 hex chars: `3aa0f42d7035802bbf61e7effd583a39`
 - Full Notion URL: `https://www.notion.so/...-38b0f42d7035808fbeb263f818eb3187` (last 32-hex token wins)
+
+`notion_get_user` accepts `user_id` as a dashed UUID or 32 hex characters
+only. It intentionally rejects Notion page URLs, whose UUID refers to a page
+rather than a user.
 
 ## Design
 
@@ -77,3 +89,4 @@ See [GRAND_DESIGN.md](GRAND_DESIGN.md) for full architecture documentation.
 - `Notion-Version: 2022-06-28` (stable, battle-tested). Newer versions rename databases to "data sources" in search responses — not adopted to keep `notion_find` filtering stable.
 - Rate limit ~3 req/s handled by token bucket + retry/backoff (see `utils/rate_limiter.py`, `utils/retry.py`).
 - 100-block append limit handled by `core/block_batcher.py` (batches of 100, sent sequentially with 0.5s between batches to preserve order and respect the ~3 req/s limit).
+- `notion_upload_file` uses the official three-step single-part flow: create `POST /v1/file_uploads` with `mode: "single_part"`, send one multipart `file` to `/send`, then append a media block whose file object is `{type: "file_upload", file_upload: {id}}`. Local files are limited to 20 MiB; multi-part uploads are intentionally not implemented. The client remains pinned to `Notion-Version: 2022-06-28`.
