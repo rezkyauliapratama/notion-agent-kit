@@ -59,9 +59,12 @@ notion-agent-kit/
 |   +-- schema_cache.py        # Database schema cache with TTL
 |
 +-- handlers/
+|   +-- comment_handler.py     # Create and list page/block comments
+|   +-- file_handler.py        # Resolve media URLs and upload local files
+|   +-- user_handler.py        # Retrieve users and token bot profiles
 |   +-- find_handler.py        # Search, query, find pages/databases
 |   +-- read_handler.py        # Read page, list blocks, query database
-|   +-- write_handler.py       # Create page, write document, append, update
+|   +-- write_handler.py       # Create page, write document, append, update, move
 |   +-- validate.py            # Input validation, block type validation
 |
 +-- models/
@@ -76,6 +79,10 @@ notion-agent-kit/
 |   +-- logger.py              # Structured logging
 |
 +-- tests/
+    +-- test_comment_handler.py
+    +-- test_file_handler.py
+    +-- test_file_upload.py
+    +-- test_user_handler.py
     +-- test_markdown_converter.py
     +-- test_edge_cases.py
     +-- test_performance.py
@@ -97,6 +104,94 @@ Read a Notion page's content and metadata.
 
 Input: `page_id`, `max_blocks?` (default 200), `depth?` (default 2)
 Output: `{ id, title, url, properties, blocks, has_more, next_cursor }`
+
+### notion_get_self
+
+Retrieve the Notion user associated with the configured token. The handler
+allowlists profile fields rather than forwarding a raw API response, so it never
+returns authentication credentials.
+
+Input: none
+Output: `{ id, name, avatar_url, type, email, email_verified, bot }`, where
+`bot` is either `null` or `{ owner_type, workspace_name, workspace_id }`.
+
+### notion_get_user
+
+Retrieve one workspace user, guest, or bot. `user_id` accepts a dashed UUID or
+32 hexadecimal characters only. It intentionally does not parse Notion page
+URLs because a UUID embedded in one identifies a page, not a user.
+
+Input: `user_id`
+Output: `{ id, name, avatar_url, type, email, email_verified, bot }`
+
+### notion_get_users
+
+List one page of workspace users. `page_size` is clamped to the API range 1–100;
+`start_cursor` is an opaque cursor returned by a prior request. The output
+preserves Notion's cursor metadata for deterministic caller-driven pagination.
+
+Input: `page_size?` (default 100), `start_cursor?`
+Output: `{ results: [user], has_more, next_cursor }`, with each `user` using
+the same allowlisted shape as `notion_get_user`.
+
+### notion_get_block_download_urls
+
+Retrieve a current direct download URL from an `image`, `file`, `video`, `pdf`,
+or `audio` block. The block is fetched on every call through `retrieve_block`,
+so a caller can refresh a Notion-hosted signed URL after it expires. The tool
+never downloads or processes the media itself.
+
+Input: `block_id`
+Output: `{ block_id, type, urls: [{ url, source: "file"|"external", expiry_time? }] }`
+
+### notion_upload_file
+
+Upload one local file with the official single-part file-upload flow, then
+attach it as a media block under a page or block. The operation is intentionally
+cohesive: it creates the upload, sends exactly one multipart `file` part, and
+appends the block only after the send succeeds. It does not implement
+multi-part uploads or external URLs.
+
+Validation occurs before any API request: `file_path` must identify a readable
+regular local file, the file must be no larger than 20 MiB, the basename must
+fit Notion's 900-byte filename limit and contain no control characters, and
+`mime_type` (when supplied) must be a valid MIME type. Otherwise MIME type is
+inferred from the basename, with `application/octet-stream` as the fallback.
+The block type is inferred as `image`, `pdf`, `video`, `audio`, or generic
+`file`. Both page and block targets use the children endpoint; `target_type`
+is explicit tool metadata and does not change the endpoint.
+
+The upload is attached with the Notion file object
+`{"type": "file_upload", "file_upload": {"id": upload_id}}`. Local file
+handles are closed by the client even when sending fails. API error objects are
+returned unchanged; local or malformed-response failures identify the phase
+(`CREATE_FAILED`, `SEND_FAILED`, or `ATTACH_FAILED`) and never include the
+configured token or local path.
+
+Input: `file_path`, `target_id`, `target_type?` (`page`|`block`, default
+`page`), `mime_type?`
+Output: `{ upload_id, block_id, target_id, target_type, filename, content_type,
+content_length, block_type }`
+
+### notion_create_comment
+
+Create a plain-text comment on either a page or a block, or reply to an existing
+comment discussion. Exactly one target is required: use `page_id` for a
+page-level comment, `block_id` for a block-level comment, or `discussion_id` to
+reply to an existing thread. The text is converted to Notion `rich_text` and is
+split at Notion's 2,000-character rich-text limit.
+
+Input: `text`, exactly one of `page_id?`, `block_id?`, `discussion_id?`
+Output: `{ comment_id, discussion_id, parent, text, rich_text, created, last_edited, created_by }`
+
+### notion_get_comments
+
+List comments attached to a page or block. The API calls this input `block_id`,
+but it accepts a page ID as well. `page_size` is clamped to the API range 1–100;
+the response preserves `has_more` and `next_cursor` from Notion.
+
+Input: `block_id`, `page_size?` (default 100)
+Output: `{ block_id, total, has_more, next_cursor, comments: [{ id, discussion_id, parent, text, rich_text, created, last_edited, created_by }] }`
 
 ### notion_write_document
 
@@ -192,6 +287,17 @@ archived object still succeeds.
 
 Input: `page_id`, `restore?` (default false), `object_type?` (auto|page|database)
 Output: `{ object: "page"|"database", id, archived, duration_ms }`
+
+### notion_move_page
+
+Move an existing page beneath another page. The client uses exactly
+`POST /v1/pages/{page_id}/move` with `{"parent": {"page_id": parent_page_id}}`;
+database-parent semantics are not used. Both IDs are normalized at the MCP
+boundary before the write. The returned `response` is the raw successful Notion
+page response, alongside its stable `page_id` and `parent` fields.
+
+Input: `page_id`, `parent_page_id`
+Output: `{ page_id, parent, response }`
 
 ### notion_append_to_page
 
@@ -314,6 +420,7 @@ Output: `{ page_id, url, blocks_copied, verified, explain? }`
 | Empty content | Filter empty blocks, skip |
 | Token expired (401) | Clear error message |
 | No access (403) | Clear error message |
+| Local file upload | Validate regular path, 20 MiB single-part limit, 900-byte basename, MIME, and control characters before `POST /v1/file_uploads`; close the file handle and return API/phase errors without credentials |
 
 ## 6. Performance Targets
 

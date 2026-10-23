@@ -458,7 +458,7 @@ class WriteHandler:
                 name, ptype, value, fallback_name_title=fallback_name_title)
         return converted
 
-    # --- Page property updates / archive ---
+    # --- Page property updates / archive / move ---
 
     async def update_page_properties(self, page_id: str, properties: dict) -> dict:
         """Update typed properties on an existing page.
@@ -526,6 +526,38 @@ class WriteHandler:
                 "id": result.get("id", page_id),
                 "archived": archived,
                 "duration_ms": duration}
+
+    async def move_page(self, page_id: str, parent_page_id: str) -> dict:
+        """Move a page beneath another page and return the updated page response.
+
+        The MCP boundary normalizes both IDs. This direct guard keeps handler
+        calls safe as well, while parent validation remains intentionally page
+        specific. The client performs the move with POST /v1/pages/{page_id}/move
+        and sends only Notion's ``parent.page_id`` shape.
+        """
+        if not isinstance(page_id, str) or not page_id.strip():
+            return {"error": True, "code": "INVALID_INPUT",
+                    "message": "page_id is required"}
+        if not isinstance(parent_page_id, str) or not parent_page_id.strip():
+            return {"error": True, "code": "INVALID_INPUT",
+                    "message": "parent_page_id is required"}
+        try:
+            result = await self.client.move_page(page_id, parent_page_id)
+        except Exception as e:
+            return {"error": True, "code": "UPDATE_FAILED", "message": str(e)}
+        if not isinstance(result, dict):
+            return {"error": True, "code": "UPDATE_FAILED",
+                    "message": "Notion returned an invalid page response"}
+        if result.get("error"):
+            return result
+        parent = result.get("parent")
+        if not isinstance(parent, dict):
+            parent = {}
+        return {
+            "page_id": result.get("id", page_id),
+            "parent": parent,
+            "response": result,
+        }
 
 
     async def write_document(self, parent_page_id: str, title: str,

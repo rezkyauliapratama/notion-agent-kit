@@ -11,11 +11,14 @@ from core.notion_client import NotionClient
 from core.schema_cache import SchemaCache
 from core.block_converter import MarkdownConverter
 from core.block_batcher import BlockBatcher
+from handlers.comment_handler import CommentHandler
+from handlers.file_handler import FileHandler
 from handlers.find_handler import FindHandler
 from handlers.query_handler import QueryHandler
 from handlers.read_handler import ReadHandler
+from handlers.user_handler import UserHandler
 from handlers.write_handler import WriteHandler
-from handlers.validate import extract_page_id
+from handlers.validate import extract_page_id, extract_user_id
 
 logger = logging.getLogger("notion-agent-kit")
 
@@ -27,14 +30,17 @@ _client: Optional[NotionClient] = None
 _cache: Optional[SchemaCache] = None
 _converter: Optional[MarkdownConverter] = None
 _batcher: Optional[BlockBatcher] = None
+_comment_handler: Optional[CommentHandler] = None
+_file_handler: Optional[FileHandler] = None
 _find_handler: Optional[FindHandler] = None
 _query_handler: Optional[QueryHandler] = None
 _read_handler: Optional[ReadHandler] = None
+_user_handler: Optional[UserHandler] = None
 _write_handler: Optional[WriteHandler] = None
 
 
 def _ensure_init():
-    global _client, _cache, _converter, _batcher, _find_handler, _query_handler, _read_handler, _write_handler
+    global _client, _cache, _converter, _batcher, _comment_handler, _file_handler, _find_handler, _query_handler, _read_handler, _user_handler, _write_handler
     if _client is not None:
         return
 
@@ -49,9 +55,12 @@ def _ensure_init():
     _cache = SchemaCache()
     _converter = MarkdownConverter()
     _batcher = BlockBatcher(client=_client)
+    _comment_handler = CommentHandler(client=_client)
+    _file_handler = FileHandler(client=_client)
     _find_handler = FindHandler(client=_client)
     _query_handler = QueryHandler(client=_client)
     _read_handler = ReadHandler(client=_client, max_depth=2)
+    _user_handler = UserHandler(client=_client)
     _write_handler = WriteHandler(client=_client, converter=_converter, batcher=_batcher, cache=_cache)
 
 
@@ -67,6 +76,19 @@ def _resolve_page_id(value: str):
         return None, {"error": True, "code": "INVALID_INPUT",
                       "message": f"Invalid page/database ID. Expected 32 hex chars, a UUID, or a Notion URL. Got: '{value}'"}
     return pid, None
+
+
+def _resolve_user_id(value: str):
+    """Normalize a raw user UUID without treating Notion page URLs as user IDs."""
+    user_id = extract_user_id(value)
+    if user_id is None:
+        return None, {
+            "error": True,
+            "code": "INVALID_INPUT",
+            "message": ("Invalid user ID. Expected 32 hex chars or a UUID; "
+                        "Notion page URLs are not user IDs."),
+        }
+    return user_id, None
 
 
 @mcp.tool()
@@ -86,6 +108,132 @@ async def notion_read_page(page_id: str, max_blocks: int = 200, depth: int = 2) 
     if err:
         return err
     return await _read_handler.read_page(page_id, max_blocks, depth)
+
+
+@mcp.tool()
+async def notion_get_self() -> dict:
+    """Retrieve the Notion user associated with this token.
+
+    Returns an allowlisted user profile (including safe bot workspace metadata
+    when available), never token or raw credential data.
+    """
+    _ensure_init()
+    assert _user_handler is not None
+    return await _user_handler.get_self()
+
+
+@mcp.tool()
+async def notion_get_user(user_id: str) -> dict:
+    """Retrieve one Notion user, guest, or bot by UUID.
+
+    User IDs accept a dashed UUID or 32 hex characters. A Notion page URL is
+    deliberately rejected because the UUID in that URL identifies a page, not a
+    user.
+    """
+    _ensure_init()
+    resolved_user_id, err = _resolve_user_id(user_id)
+    if err:
+        return err
+    assert resolved_user_id is not None
+    assert _user_handler is not None
+    return await _user_handler.get_user(resolved_user_id)
+
+
+@mcp.tool()
+async def notion_get_users(page_size: int = 100,
+                           start_cursor: Optional[str] = None) -> dict:
+    """List one page of workspace users.
+
+    `page_size` is clamped to 1–100. Pass the opaque `next_cursor` from a
+    prior response as `start_cursor`; output preserves `results`, `has_more`,
+    and `next_cursor` for stable pagination.
+    """
+    _ensure_init()
+    assert _user_handler is not None
+    return await _user_handler.get_users(page_size, start_cursor)
+
+
+@mcp.tool()
+async def notion_get_block_download_urls(block_id: str) -> dict:
+    """Get the current direct download URL for a Notion media block.
+
+    Supports image, file, video, pdf, and audio blocks. The response is
+    ``{block_id, type, urls}``; each URL entry contains ``url`` and
+    ``source`` (``file`` for a Notion-hosted signed URL or ``external``), plus
+    ``expiry_time`` when Notion provides one. Retrieve the block again to
+    refresh an expired Notion-hosted URL.
+    """
+    _ensure_init()
+    resolved_block_id, err = _resolve_page_id(block_id)
+    if err:
+        return err
+    assert resolved_block_id is not None
+    assert _file_handler is not None
+    return await _file_handler.get_block_download_urls(resolved_block_id)
+
+
+@mcp.tool()
+async def notion_upload_file(file_path: str, target_id: str,
+                             target_type: str = "page",
+                             mime_type: Optional[str] = None) -> dict:
+    """Upload one local file and attach it as a Notion media block.
+
+    The file must be at most 20 MiB (single-part flow). `target_id` is the
+    page/block whose children receive the new file block; `target_type` is
+    explicit metadata and may be `page` or `block`. MIME type is inferred from
+    the filename unless `mime_type` is supplied.
+    """
+    _ensure_init()
+    resolved_target_id, err = _resolve_page_id(target_id)
+    if err:
+        return err
+    assert resolved_target_id is not None
+    assert _file_handler is not None
+    return await _file_handler.upload_file(
+        file_path, resolved_target_id, target_type=target_type, mime_type=mime_type)
+
+
+@mcp.tool()
+async def notion_create_comment(text: str, page_id: Optional[str] = None,
+                                block_id: Optional[str] = None,
+                                discussion_id: Optional[str] = None) -> dict:
+    """Create a plain-text comment on a page or block, or reply to a discussion.
+
+    Provide exactly one target: `page_id` for a page comment, `block_id` for a
+    block comment, or `discussion_id` to reply to an existing discussion.
+    """
+    _ensure_init()
+    if page_id is not None:
+        page_id, err = _resolve_page_id(page_id)
+        if err:
+            return err
+    if block_id is not None:
+        block_id, err = _resolve_page_id(block_id)
+        if err:
+            return err
+    if discussion_id is not None:
+        discussion_id, err = _resolve_page_id(discussion_id)
+        if err:
+            return err
+    assert _comment_handler is not None
+    return await _comment_handler.create_comment(
+        text, page_id=page_id, block_id=block_id, discussion_id=discussion_id)
+
+
+@mcp.tool()
+async def notion_get_comments(block_id: str, page_size: int = 100) -> dict:
+    """List comments attached to a Notion page or block.
+
+    `block_id` may be either a block ID or a page ID. Results include
+    `has_more` and `next_cursor` when Notion returns another page.
+    """
+    _ensure_init()
+    block_id, err = _resolve_page_id(block_id)
+    if err:
+        return err
+    assert block_id is not None
+    assert _comment_handler is not None
+    return await _comment_handler.get_comments(block_id, page_size)
 
 
 @mcp.tool()
@@ -316,6 +464,27 @@ async def notion_archive_page(page_id: str, restore: bool = False,
         return err
     return await _write_handler.archive_page(page_id, restore=restore,
                                              object_type=object_type)
+
+
+@mcp.tool()
+async def notion_move_page(page_id: str, parent_page_id: str) -> dict:
+    """Move an existing page beneath another page.
+
+    Both IDs accept a raw UUID or Notion URL. The parent must be a page; this
+    tool uses Notion's page-parent update shape and does not use database
+    parent semantics. Output: {page_id, parent, response}.
+    """
+    _ensure_init()
+    page_id, err = _resolve_page_id(page_id)
+    if err:
+        return err
+    parent_page_id, err = _resolve_page_id(parent_page_id)
+    if err:
+        return err
+    assert page_id is not None
+    assert parent_page_id is not None
+    assert _write_handler is not None
+    return await _write_handler.move_page(page_id, parent_page_id)
 
 
 @mcp.tool()
