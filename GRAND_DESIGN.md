@@ -267,6 +267,63 @@ created_by, last_edited_time, last_edited_by, unique_id) return a clear
 Input: `database_id`, `properties`
 Output: `{ page_id, url, properties }`
 
+### notion_upsert_database_row
+
+Create or update exactly one row using `unique_key` + `unique_value`, or a
+caller-supplied raw `filter_obj`. The filter is queried before any write;
+zero matches creates, one match updates only requested properties, and multiple
+matches return `CONFLICT` without mutation. The operation reads the matched page,
+checks an optional `expected_fingerprint`, reads again before PATCH, and verifies
+read-back. An ambiguous create failure is re-queried by the same unique filter
+before returning failure. Optional `idempotency_key` is backed by the shared
+SQLite state store, with expiry, payload-hash replay, and conflict semantics.
+
+Input: `database_id`, `unique_key`, `unique_value?`, `properties?`, `filter_obj?`,
+`expected_fingerprint?`, `idempotency_key?`
+
+Output: `{ page_id, url, operation, changed, verified, fingerprint, created,
+updated, matched }`; duplicate/stale state returns `CONFLICT`.
+
+### notion_replace_page_content
+
+Read the page and its complete recursive child tree, calculate stable anchors, and
+apply the minimal safe update. Raw blocks with existing Notion IDs are stable
+anchors; exact normalized type/content anchors are used otherwise. Existing
+matched child identities are preserved. Reordering and insertion are preflighted;
+`ORDERING_UNPROVEN` is returned without mutation unless the client advertises the
+ordered `after` capability.
+
+Input: `page_id`, exactly one of `markdown?` or `blocks?`,
+`expected_fingerprint?`, `idempotency_key?`
+
+Output: `{ page_id, operation, changed, verified, fingerprint, matched, created,
+updated, deleted, total_blocks }`.
+
+### notion_bulk_update_rows
+
+Run a bounded, explicit-filter workflow or a durable resumable job. Synchronous
+calls cap at 500 rows for compatibility. A request with `max_rows > 500`,
+`job_id`, or `resume=true` follows opaque cursors sequentially, checkpoints after
+each row, and can be resumed with `notion_resume_bulk_update`; status is read
+with `notion_get_bulk_job`. Fresh fingerprint guards and read-back verification
+remain per-row. Scheduling is sequential and the provider client owns rate-limit
+backoff. The result reports per-row results, `matched`, `affected`, `updated`,
+`skipped`, `duplicates`, `errors`, truncation, and verification. Optional
+`expected_fingerprints` supports caller-provided stale-state guards.
+
+Input: `database_id`, `filter_obj`, `properties`, `dry_run?`, `max_rows?`,
+`expected_fingerprints?`, `job_id?`, `resume?`, `batch_size?`
+
+Output: `{ database_id, operation, changed, verified, matched, affected, updated,
+skipped, duplicates, errors, results }`, plus `job_id`, `status`, and
+`next_cursor` for resumable jobs.
+
+### notion_get_bulk_job / notion_resume_bulk_update
+
+Read a durable job checkpoint or resume it by `job_id`. These are local state
+operations; they do not call Notion for status inspection, while resume continues
+provider pagination with the saved filter and payload hash.
+
 ### notion_update_page_properties
 
 Update properties on an existing page. The page is fetched first so each
@@ -421,6 +478,42 @@ Output: `{ page_id, url, blocks_copied, verified, explain? }`
 | Token expired (401) | Clear error message |
 | No access (403) | Clear error message |
 | Local file upload | Validate regular path, 20 MiB single-part limit, 900-byte basename, MIME, and control characters before `POST /v1/file_uploads`; close the file handle and return API/phase errors without credentials |
+
+## 5a. Stage 1/2 reliability contract
+
+High-level writes use additive result metadata: `operation`, `changed`,
+`verified`, fingerprints, and counts. Existing low-level tool keys are retained
+for backward compatibility. Fingerprints hash the mutable page properties and,
+for content replacement, the complete recursive block tree. The API version remains
+`2022-06-28`; it provides no conditional PATCH, so the guard is optimistic and
+cannot eliminate a race after the final read.
+
+`notion_upsert_database_row`, `notion_replace_page_content`, and
+`notion_bulk_update_rows` perform a second read immediately before mutation and
+return `CONFLICT` when state changed. Upsert duplicate matching is a hard
+conflict. Idempotency records use the shared SQLite store with expiry and payload
+hashes; optional audit records are redacted and retention-bounded. Stable content
+anchors recurse through nested children. Reordering and insertion are refused
+unless the provider client proves ordered `after` semantics. Bulk updates remain
+synchronous up to 500 rows and use durable sequential jobs above that bound.
+
+## 5b. Stage 3/4 completion status
+
+Implemented in this working copy: shared SQLite idempotency with expiry and
+payload hashes; optional redacted audit records with bounded retention; durable
+bulk job state with optimistic versioned checkpoints and resume; provider-neutral
+fixtures; recursive nested block diffing; explicit ordering capability checks;
+sequential cursor pagination beyond 500 rows; and additive metadata on reviewed
+legacy write tools. Focused evidence is in
+`tests/test_stage34_workflows.py`; it does not require Notion credentials.
+
+The Notion client remains pinned to `Notion-Version: 2022-06-28`. That API has no
+server-side conditional PATCH, ETag, or compare-and-swap primitive. Fingerprint
+checks therefore remain optimistic: a race after the final guard read cannot be
+eliminated. Safe insertion is available only through the explicitly marked
+`after` capability; insert-before and unproven reordering return
+`ORDERING_UNPROVEN` without mutation. Live provider integration testing remains
+blocked unless credentials and network policy are explicitly provided.
 
 ## 6. Performance Targets
 
