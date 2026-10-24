@@ -16,7 +16,7 @@ Run the test suite:
 python -m unittest discover -s tests -v
 ```
 
-## Tools (24)
+## Tools (29)
 
 | Tool | Description |
 |------|-------------|
@@ -34,6 +34,11 @@ python -m unittest discover -s tests -v
 | `notion_inspect_database` | Inspect database schema (properties, types, options) |
 | `notion_create_database` | Create a database inside a page. Simple or raw property schema; auto-adds a `Name` title property if missing; number-format aliases normalized (`idr`→`rupiah`) |
 | `notion_add_database_row` | Add a row to a database; values auto-converted from the schema (incl. date ranges and relation) |
+| `notion_upsert_database_row` | Create/update one row by a type-aware unique key or raw `filter_obj`; duplicate matches return `CONFLICT`, with fingerprint/read-back guards and optional durable `idempotency_key` |
+| `notion_replace_page_content` | Read/diff/apply markdown or raw blocks; preserves unchanged anchored blocks, updates/appends/deletes safely, and verifies final content |
+| `notion_bulk_update_rows` | Synchronous update by explicit `filter_obj` (max 500), or a durable resumable cursor job with `max_rows > 500`, `job_id`, `resume`, and `batch_size` |
+| `notion_get_bulk_job` | Read durable resumable bulk job status (`job_id`) |
+| `notion_resume_bulk_update` | Resume a durable bulk job from its checkpoint (`job_id`) |
 | `notion_append_to_page` | Append markdown content to an existing page. Optional `after` inserts after a sibling block |
 | `notion_update_block` | Update ONE block from markdown (type-preserving; plain text auto-maps onto heading/quote/list) or raw JSON via `blocks` |
 | `notion_delete_block` | Delete a block + children. Idempotent: already-deleted blocks return `already_deleted: true` |
@@ -45,7 +50,63 @@ python -m unittest discover -s tests -v
 | `notion_move_page` | Move a page under another page (`page_id`, `parent_page_id`); uses page-parent semantics only and returns `{page_id, parent, response}` |
 | `notion_query_database` | Query a database. Pagination params: `start_cursor`, `fetch_all` (follows cursors), `max_rows` (default 500, max 2000) |
 
-## Accepted ID formats
+## Stage 3/4 durability and extended workflows
+
+The server initializes one shared SQLite state database per deployment. Set
+`NOTION_STATE_DB` to an explicit writable path (the default is
+`~/.cache/notion-agent-kit/state.sqlite3`), `NOTION_IDEMPOTENCY_TTL_SECONDS`
+for replay expiry, and `NOTION_AUDIT_ENABLED=1` plus `NOTION_AUDIT_RETENTION`
+for bounded, redacted audit records. The database stores hashes, safe operation
+results, and job checkpoints; it never receives `NOTION_TOKEN`.
+
+- **Durable idempotency:** upsert and replacement replay the same payload hash
+  across handler instances/workers and return `CONFLICT` for key reuse with a
+  different payload. Expired records are purged transactionally.
+- **Nested replacement:** `notion_replace_page_content` recursively diffs child
+  trees and preserves matched block IDs. It preflights all levels. Existing
+  block reordering and insertion-before are rejected as `ORDERING_UNPROVEN`
+  unless the client explicitly advertises the documented `after` ordering
+  capability; no mutation is sent for those preflight conflicts.
+- **Resumable bulk:** the synchronous path remains bounded at 500 rows for
+  compatibility. `max_rows > 500`, `job_id`, or `resume=true` uses sequential,
+  cursor-based pagination with a durable per-row checkpoint. Use
+  `notion_get_bulk_job` and `notion_resume_bulk_update` to inspect/resume a job.
+  The provider client remains rate-limit-aware and no parallel writes are used.
+- **Metadata compatibility:** legacy update/archive/block writes retain their
+  existing keys and add `operation`, `changed`, and `verified` (where a
+  read-back is not part of the legacy contract, `verified` is `null`).
+
+Provider-neutral offline fixtures cover SQLite replay/conflict and permissions,
+redacted bounded audit, nested identity preservation, ordering refusal, paged
+bulk jobs, and legacy metadata contracts. No live Notion integration is run
+unless credentials and network policy are deliberately supplied.
+
+
+The three high-level write tools return additive metadata where applicable:
+`operation`, `changed`, `verified`, a state `fingerprint`, and operation-specific
+counts. Existing tool response keys and API behavior remain unchanged.
+
+- **Optimistic concurrency:** upsert, page replacement, and bulk updates read a
+  fingerprint and read again immediately before mutation. A stale expected
+  fingerprint or a changed preparation read returns `CONFLICT`; no stale PATCH
+  is sent. Notion API `2022-06-28` has no conditional-write primitive, so this
+  is a guarded read/modify/write cycle rather than an atomic server-side CAS.
+- **Idempotency:** upsert and page replacement accept `idempotency_key`. The
+  same input is replayed across handler instances/workers when `NOTION_STATE_DB`
+  points to the shared SQLite store. A different payload under the same key returns
+  `CONFLICT`. Upsert also re-queries its unique filter after an ambiguous create
+  exception before permitting a retry. It is not a Notion-side idempotency
+  token. Unique-key matching remains the primary duplicate defense.
+- **Stable block matching:** raw blocks with existing IDs are preferred anchors;
+  otherwise exact normalized type/content anchors are used. Replacement recursively
+  diffs nested child trees and preserves matched IDs. It preflights reordering and
+  requires the client's explicit ordered-`after` capability for safe insertions;
+  unsupported ordering returns `ORDERING_UNPROVEN` without mutation.
+- **Bulk safety:** `filter_obj` is mandatory. Synchronous updates cap at 500;
+  larger requests use durable sequential pagination/checkpoints. `dry_run`
+  performs preview reads without PATCH. Results include matched, affected,
+  verification state.
+
 
 Page, database, and block-oriented `*_id` parameters accept:
 - UUID with dashes: `3aa0f42d-7035-802b-bf61-e7effd583a39`

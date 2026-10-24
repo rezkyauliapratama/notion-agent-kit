@@ -1,8 +1,13 @@
 """Write handler - create pages, write documents, append blocks."""
 
+import copy
+import hashlib
+import json
 import logging
 import time
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
+
+from core.state_store import SQLiteStateStore, StateConflict
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +155,17 @@ def _flatten_tree(nodes):
 class WriteHandler:
     """Handle notion_write_document and notion_write_blocks tools."""
 
-    def __init__(self, client, converter, batcher, cache=None):
+    def __init__(self, client, converter, batcher, cache=None, state_store=None,
+                 audit_store=None):
         self.client = client
         self.converter = converter
         self.batcher = batcher
         self.cache = cache
+        # Production server instances inject the shared SQLite store. Direct
+        # handler tests use an isolated SQLite database rather than the old
+        # process-local dictionary, so the code path stays identical.
+        self.state_store = state_store or SQLiteStateStore(":memory:")
+        self.audit_store = audit_store or self.state_store
 
     async def create_database(self, parent_page_id: str, title: str, properties: dict) -> dict:
         """Create a database with the given schema.
@@ -458,7 +469,923 @@ class WriteHandler:
                 name, ptype, value, fallback_name_title=fallback_name_title)
         return converted
 
-    # --- Page property updates / archive / move ---
+    # --- Stage 1/2 safety helpers and high-level workflows ---
+
+    @staticmethod
+    def _canonical(value) -> str:
+        """Return a deterministic JSON representation for fingerprints."""
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+
+    @classmethod
+    def _fingerprint(cls, value) -> str:
+        return hashlib.sha256(cls._canonical(value).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _page_fingerprint(cls, page: dict, tree: Optional[list] = None) -> str:
+        """Fingerprint mutable page state, excluding transport-only identity fields."""
+        state = {
+            "properties": page.get("properties", {}),
+            "archived": page.get("archived", False),
+            "last_edited_time": page.get("last_edited_time"),
+        }
+        if tree is not None:
+            # Include the complete nested tree; top-level-only fingerprints
+            # would miss a concurrent edit inside a toggle, column, or table.
+            state["blocks"] = tree
+        return cls._fingerprint(state)
+
+    @staticmethod
+    def _conflict(message: str, expected=None, actual=None) -> dict:
+        result = {"error": True, "code": "CONFLICT", "message": message}
+        if expected is not None:
+            result["expected_fingerprint"] = expected
+        if actual is not None:
+            result["actual_fingerprint"] = actual
+        return result
+
+    @staticmethod
+    def _metadata(operation: str, changed: bool, verified, **counts) -> dict:
+        result = {"operation": operation, "changed": bool(changed),
+                  "verified": verified}
+        result.update({key: value for key, value in counts.items() if value is not None})
+        return result
+
+    def _idempotency_replay(self, operation: str, key: Optional[str], payload_hash: str):
+        if not key:
+            return None
+        found = self.state_store.idempotency_lookup(operation, key, payload_hash)
+        if found and found[0] == "conflict":
+            return self._conflict("idempotency_key was already used with different input")
+        if found and found[0] == "replay":
+            return dict(found[1])
+        return None
+
+    def _remember_idempotency(self, operation: str, key: Optional[str], payload_hash: str,
+                              result: dict):
+        if not key:
+            return result
+        status, prior = self.state_store.idempotency_store(operation, key, payload_hash, result)
+        if status == "conflict":
+            return self._conflict("idempotency_key was already used with different input")
+        return dict(prior or result)
+
+    def _audit(self, operation: str, result: dict, target_id: Optional[str] = None,
+               payload_hash: Optional[str] = None) -> None:
+        try:
+            self.audit_store.record_audit(operation, result, target_id, payload_hash)
+        except Exception:
+            # Audit is deliberately optional and must not turn a completed
+            # provider write into a failed write.
+            logger.warning("operation audit write failed", exc_info=True)
+
+    @staticmethod
+    def _property_value(prop: dict):
+        """Extract a comparison-friendly value from a raw Notion property."""
+        if not isinstance(prop, dict):
+            return None
+        ptype = prop.get("type")
+        data = prop.get(ptype, {})
+        if ptype in ("title", "rich_text"):
+            return _plain_text(data)
+        if ptype in ("select", "status"):
+            return data.get("name") if isinstance(data, dict) else None
+        if ptype == "multi_select":
+            return [item.get("name") if isinstance(item, dict) else item for item in (data or [])]
+        if ptype == "relation":
+            return [item.get("id") for item in (data or []) if isinstance(item, dict)]
+        if ptype == "date":
+            return {key: data.get(key) for key in ("start", "end", "time_zone")
+                    if isinstance(data, dict) and data.get(key) is not None} or None
+        return data
+
+    @classmethod
+    def _desired_value(cls, value):
+        if isinstance(value, dict):
+            for key in API_PROPERTY_KEYS:
+                if key in value:
+                    data = value[key]
+                    if key in ("title", "rich_text"):
+                        return _plain_text(data)
+                    if key in ("select", "status"):
+                        return data.get("name") if isinstance(data, dict) else None
+                    if key == "multi_select":
+                        return [x.get("name") if isinstance(x, dict) else x for x in (data or [])]
+                    if key == "relation":
+                        return [x.get("id") if isinstance(x, dict) else x for x in (data or [])]
+                    return data
+        return value
+
+    @classmethod
+    def _properties_match(cls, page: dict, desired: dict) -> bool:
+        props = page.get("properties", {})
+        for name, wanted in desired.items():
+            if name not in props:
+                return False
+            got = cls._property_value(props[name])
+            want = cls._desired_value(wanted)
+            if cls._canonical(got) != cls._canonical(want):
+                return False
+        return True
+
+    async def _query_raw_rows(self, database_id: str, filter_obj: dict,
+                              max_rows: int = 500) -> tuple[list, bool]:
+        """Fetch bounded raw rows without changing the public query contract."""
+        rows, cursor, truncated = [], None, False
+        while len(rows) < max_rows:
+            kwargs = {"filter_obj": filter_obj, "page_size": min(100, max_rows - len(rows))}
+            if cursor:
+                kwargs["start_cursor"] = cursor
+            response = await self.client.query_database(database_id, **kwargs)
+            if response.get("error"):
+                return response, False
+            rows.extend(response.get("results", []) or [])
+            if not response.get("has_more") or not response.get("next_cursor"):
+                break
+            cursor = response["next_cursor"]
+        if len(rows) > max_rows:
+            rows = rows[:max_rows]
+            truncated = True
+        elif cursor and len(rows) >= max_rows:
+            truncated = True
+        return rows, truncated
+
+    @classmethod
+    def _property_filter(cls, key: str, value, schema: dict) -> dict:
+        spec = schema.get(key, {}) if isinstance(schema, dict) else {}
+        ptype = spec.get("type") if isinstance(spec, dict) else None
+        if ptype in ("title", "rich_text"):
+            return {"property": key, ptype: {"equals": str(value)}}
+        if ptype in ("number", "checkbox", "url", "email", "phone_number"):
+            return {"property": key, ptype: {"equals": value}}
+        if ptype in ("select", "status"):
+            return {"property": key, ptype: {"equals": {"name": value}}}
+        if ptype == "date" and isinstance(value, dict):
+            return {"property": key, "date": {"equals": value.get("start")}}
+        # Unknown schemas are deliberately not guessed: callers can supply a
+        # raw filter_obj, avoiding a create caused by an invalid local guess.
+        raise ValueError(f"Cannot build a safe filter for property '{key}'; pass filter_obj explicitly")
+
+    async def upsert_database_row(self, database_id: str, unique_key: str,
+                                  unique_value: Any = None, properties: Optional[dict] = None,
+                                  filter_obj: Optional[dict] = None,
+                                  expected_fingerprint: Optional[str] = None,
+                                  idempotency_key: Optional[str] = None) -> dict:
+        """Create or update exactly one database row using a safe read/verify cycle.
+
+        A unique-key query is followed by a second read immediately before an
+        update. This is optimistic concurrency (the 2022 API has no conditional
+        PATCH): a changed fingerprint returns CONFLICT rather than overwriting.
+        """
+        operation = "notion_upsert_database_row"
+        if not isinstance(unique_key, str) or not unique_key.strip():
+            return {"error": True, "code": "INVALID_INPUT", "message": "unique_key is required"}
+        if properties is None:
+            properties = {}
+        if not isinstance(properties, dict):
+            return {"error": True, "code": "INVALID_INPUT", "message": "properties must be a dict"}
+        if unique_value is None and unique_key not in properties:
+            return {"error": True, "code": "INVALID_INPUT", "message": "unique_value is required"}
+        if unique_value is None:
+            unique_value = properties[unique_key]
+        request_properties = dict(properties)
+        request_properties.setdefault(unique_key, unique_value)
+        request_fingerprint = self._fingerprint(
+            {"database_id": database_id, "unique_key": unique_key,
+             "unique_value": unique_value, "properties": request_properties})
+        replay = self._idempotency_replay(operation, idempotency_key, request_fingerprint)
+        if replay is not None:
+            return replay
+
+        schema = await self._get_database_schema(database_id)
+        if schema.get("error"):
+            return schema
+        try:
+            effective_filter = filter_obj or self._property_filter(unique_key, unique_value, schema)
+        except ValueError as exc:
+            return {"error": True, "code": "INVALID_INPUT", "message": str(exc)}
+        found = await self._query_raw_rows(database_id, effective_filter, max_rows=101)
+        if isinstance(found[0], dict) and found[0].get("error"):
+            return found[0]
+        matches, truncated = found
+        if filter_obj is not None:
+            # A custom filter is allowed, but it cannot weaken the unique-key
+            # invariant: only rows whose actual key equals unique_value count.
+            filtered_matches = []
+            for item in matches:
+                row_properties: dict = item.get("properties") or {}
+                key_property: dict = row_properties.get(unique_key) or {}
+                if self._property_value(key_property) == unique_value:
+                    filtered_matches.append(item)
+            matches = filtered_matches
+        # A bounded query that reaches 101 is enough to establish duplicate
+        # conflict without downloading an unbounded database.
+        if len(matches) > 1 or truncated:
+            return self._conflict(
+                f"Unique key '{unique_key}' matched multiple rows; refusing to choose one",
+                actual=f"matches>1 ({min(len(matches), 101)})")
+
+        desired = dict(properties)
+        if not matches:
+            desired.setdefault(unique_key, unique_value)
+            try:
+                api_props = self._convert_row_properties(schema, desired)
+                created = await self.client.create_page(
+                    {"type": "database_id", "database_id": database_id}, api_props)
+            except Exception as exc:
+                # The request may have reached Notion. Re-query before exposing
+                # CREATE_FAILED, which prevents the common duplicate-on-retry case.
+                retry_rows, _ = await self._query_raw_rows(database_id, effective_filter, max_rows=2)
+                if isinstance(retry_rows, list) and len(retry_rows) == 1:
+                    matches = retry_rows
+                else:
+                    return {"error": True, "code": "CREATE_FAILED", "message": str(exc)}
+            else:
+                if created.get("error"):
+                    return created
+                page_id = created.get("id", "")
+                page = await self.client.retrieve_page(page_id)
+                if page.get("error"):
+                    return {"error": True, "code": "VERIFY_FAILED", "message": "Created row could not be read back"}
+                verified = self._properties_match(page, desired)
+                result = {"page_id": page_id, "url": page.get("url", ""),
+                          **self._metadata(operation, True, verified, created=1,
+                                           updated=0, matched=0, fingerprint=self._page_fingerprint(page))}
+                if not verified:
+                    result["explain"] = "created row did not match requested properties on read-back"
+                if idempotency_key:
+                    result = self._remember_idempotency(operation, idempotency_key,
+                                                        request_fingerprint, result)
+                self._audit(operation, result, page_id, request_fingerprint)
+                return result
+
+        # A failed create may have produced one row; continue through update
+        # verification so the operation remains safe and idempotent.
+        if len(matches) != 1:
+            return self._conflict(f"Unique key '{unique_key}' did not resolve to one row")
+        page_id = matches[0].get("id", "")
+        first = await self.client.retrieve_page(page_id)
+        if first.get("error"):
+            return first
+        actual_fp = self._page_fingerprint(first)
+        if expected_fingerprint and expected_fingerprint != actual_fp:
+            return self._conflict("row changed since expected_fingerprint", expected_fingerprint, actual_fp)
+        second = await self.client.retrieve_page(page_id)
+        if second.get("error"):
+            return second
+        second_fp = self._page_fingerprint(second)
+        if second_fp != actual_fp:
+            return self._conflict("row changed during upsert; retry with a fresh fingerprint",
+                                  actual_fp, second_fp)
+        # Keep the unique key stable unless the caller explicitly included it.
+        update_values = dict(properties)
+        try:
+            api_props = self._convert_row_properties(schema, update_values)
+        except ValueError as exc:
+            return {"error": True, "code": "INVALID_INPUT", "message": str(exc)}
+        changed = not self._properties_match(second, update_values)
+        if changed:
+            try:
+                updated = await self.client.update_page_properties(page_id, api_props)
+            except Exception as exc:
+                after_error = await self.client.retrieve_page(page_id)
+                if not after_error.get("error") and self._properties_match(after_error, update_values):
+                    second = after_error
+                else:
+                    return {"error": True, "code": "UPDATE_FAILED", "message": str(exc)}
+            else:
+                if updated.get("error"):
+                    return updated
+                second = await self.client.retrieve_page(page_id)
+                if second.get("error"):
+                    return {"error": True, "code": "VERIFY_FAILED", "message": "Updated row could not be read back"}
+        verified = self._properties_match(second, update_values)
+        result = {"page_id": page_id, "url": second.get("url", matches[0].get("url", "")),
+                  **self._metadata(operation, changed, verified, created=0, updated=1 if changed else 0,
+                                   matched=1, fingerprint=self._page_fingerprint(second))}
+        if not verified:
+            result["explain"] = "updated row did not match requested properties on read-back"
+        if idempotency_key:
+            result = self._remember_idempotency(operation, idempotency_key,
+                                                request_fingerprint, result)
+        self._audit(operation, result, page_id, request_fingerprint)
+        return result
+
+    @staticmethod
+    def _stable_anchor(block: dict) -> str:
+        """Content anchor used only for exact matching; IDs are preferred."""
+        if not isinstance(block, dict):
+            return ""
+        block_type = block.get("type", "")
+        data: Dict[str, Any] = copy.deepcopy(block.get(block_type) or {})
+
+        def normalize_rich(parts):
+            normalized = []
+            for part in parts or []:
+                if not isinstance(part, dict):
+                    continue
+                item = {"text": _plain_text([part])}
+                annotations = part.get("annotations")
+                if annotations:
+                    item["annotations"] = WriteHandler._normalize_annotations(annotations)
+                href = part.get("href")
+                text_obj = part.get("text")
+                if not href and isinstance(text_obj, dict):
+                    link = text_obj.get("link")
+                    if isinstance(link, dict):
+                        href = link.get("url")
+                if href:
+                    item["href"] = href
+                normalized.append(item)
+            return normalized
+
+        if isinstance(data, dict):
+            for key in ("rich_text", "caption"):
+                if key in data:
+                    data[key] = normalize_rich(data[key])
+            if block_type == "table_row":
+                data["cells"] = [normalize_rich(cell) for cell in data.get("cells", [])]
+            data.pop("children", None)
+        return f"{block_type}:{WriteHandler._canonical(data)}"
+
+    @staticmethod
+    def _writable_block(block: dict, include_children: bool = False) -> dict:
+        result = copy.deepcopy(block)
+        for key in ("id", "object", "parent", "created_time", "last_edited_time",
+                    "created_by", "last_edited_by", "archived", "in_trash", "has_children"):
+            result.pop(key, None)
+        if not include_children and isinstance(result.get(result.get("type")), dict):
+            result[result["type"]].pop("children", None)
+        return result
+
+    async def _legacy_replace_page_content(self, page_id: str, markdown: Optional[str] = None,
+                                   blocks: Optional[list] = None,
+                                   expected_fingerprint: Optional[str] = None,
+                                   idempotency_key: Optional[str] = None) -> dict:
+        """Legacy top-level implementation retained for source compatibility.
+
+        Raw blocks carrying an existing ``id`` are stable anchors. Blocks
+        without IDs use an exact type/content anchor; changed anonymous blocks
+        are therefore recreated instead of guessed by position.
+        """
+        operation = "notion_replace_page_content"
+        if (markdown is None) == (blocks is None):
+            return {"error": True, "code": "INVALID_INPUT",
+                    "message": "provide exactly one of markdown or blocks"}
+        request_fp = self._fingerprint({"page_id": page_id, "markdown": markdown, "blocks": blocks})
+        replay = self._idempotency_replay(operation, idempotency_key, request_fp)
+        if replay is not None:
+            return replay
+        try:
+            desired = self.converter.convert(markdown) if markdown is not None else blocks
+        except Exception as exc:
+            return {"error": True, "code": "PARSE_FAILED", "message": f"Failed to parse markdown: {exc}"}
+        if not isinstance(desired, list):
+            return {"error": True, "code": "INVALID_INPUT", "message": "blocks must be a list"}
+        missing = find_table_missing_children(desired)
+        if missing:
+            return {"error": True, "code": "INVALID_INPUT", "message": "table blocks must include inline children"}
+        try:
+            page = await self.client.retrieve_page(page_id)
+            tree = await self._read_block_tree(page_id)
+        except Exception as exc:
+            return {"error": True, "code": "FETCH_FAILED", "message": str(exc)}
+        if page.get("error"):
+            return page
+        initial_fp = self._page_fingerprint(page, tree)
+        if expected_fingerprint and expected_fingerprint != initial_fp:
+            return self._conflict("page changed since expected_fingerprint", expected_fingerprint, initial_fp)
+        # Re-read immediately before any mutation to close the normal stale-read gap.
+        current_page = await self.client.retrieve_page(page_id)
+        current_tree = await self._read_block_tree(page_id)
+        current_fp = self._page_fingerprint(current_page, current_tree)
+        if current_fp != initial_fp:
+            return self._conflict("page changed during replace preparation", initial_fp, current_fp)
+        existing = [node["block"] for node in current_tree]
+        by_id = {str(block.get("id")): block for block in existing if block.get("id")}
+        by_anchor = {}
+        for block in existing:
+            by_anchor.setdefault(self._stable_anchor(block), []).append(block)
+        matches, used = [], set()
+        for want in desired:
+            candidate = None
+            if isinstance(want, dict) and want.get("id") in by_id:
+                candidate = by_id[str(want["id"])]
+            else:
+                options = by_anchor.get(self._stable_anchor(want), [])
+                candidate = next((item for item in options if item.get("id") not in used), None)
+            matches.append(candidate)
+            if candidate and candidate.get("id"):
+                used.add(candidate["id"])
+        # We cannot insert before an existing first child with this API. Refuse
+        # that shape rather than silently changing user-visible order.
+        first_new = next((i for i, item in enumerate(matches) if item is None), None)
+        if first_new == 0 and existing and any(item is not None for item in matches[1:]):
+            return {"error": True, "code": "INVALID_INPUT",
+                    "message": "cannot safely insert a new first block before existing content; anchor the desired first block or replace the page with an empty target"}
+        matched_order = [item.get("id") for item in matches if item]
+        existing_order = [item.get("id") for item in existing if item.get("id") in used]
+        if matched_order != existing_order:
+            return {"error": True, "code": "INVALID_INPUT",
+                    "message": "requested content reorders existing blocks; positional reordering is not applied safely"}
+        updated = created = deleted = 0
+        result_ids = []
+        for index, (want, old) in enumerate(zip(desired, matches)):
+            if old:
+                result_ids.append(old.get("id"))
+                if self._stable_anchor(want) != self._stable_anchor(old):
+                    if old.get("type") != want.get("type"):
+                        return {"error": True, "code": "BLOCK_TYPE_MISMATCH",
+                                "message": f"block '{old.get('id')}' type cannot change from {old.get('type')} to {want.get('type')}"}
+                    response = await self.client.update_block(old["id"], self._writable_block(want))
+                    if response.get("error"):
+                        return response
+                    updated += 1
+                continue
+            payload = self._writable_block(want)
+            after = result_ids[-1] if result_ids else None
+            response = await self.client.append_block_children(page_id, [payload], after=after)
+            if response.get("error"):
+                return response
+            made = response.get("results") or []
+            new_id = made[0].get("id") if made and isinstance(made[0], dict) else None
+            if not new_id:
+                return {"error": True, "code": "APPLY_FAILED", "message": "new block ID was not returned; page was left otherwise unchanged"}
+            result_ids.append(new_id)
+            created += 1
+        for old in existing:
+            if old.get("id") not in used and old.get("id") not in result_ids:
+                response = await self.client.delete_block(old["id"])
+                if response.get("error") and response.get("code") != "NOT_FOUND":
+                    return response
+                deleted += 1
+        final_page = await self.client.retrieve_page(page_id)
+        final_tree = await self._read_block_tree(page_id)
+        final_blocks = [node["block"] for node in final_tree]
+        verified = len(final_blocks) == len(desired) and all(
+            self._stable_anchor(got) == self._stable_anchor(want)
+            for got, want in zip(final_blocks, desired))
+        result = {"page_id": page_id,
+                  **self._metadata(operation, bool(updated or created or deleted), verified,
+                                   matched=sum(1 for x in matches if x), created=created,
+                                   updated=updated, deleted=deleted,
+                                   total_blocks=len(desired),
+                                   fingerprint=self._page_fingerprint(final_page, final_tree))}
+        if not verified:
+            result["explain"] = "final page content did not match the requested block sequence"
+        return result
+
+    async def _legacy_bulk_update_rows(self, database_id: str, filter_obj: Optional[dict],
+                               properties: dict, dry_run: bool = False,
+                               max_rows: int = 100,
+                               expected_fingerprints: Optional[dict] = None) -> dict:
+        """Legacy bounded implementation retained for source compatibility."""
+        operation = "notion_bulk_update_rows"
+        if not isinstance(filter_obj, dict) or not filter_obj:
+            return {"error": True, "code": "INVALID_INPUT", "message": "filter_obj is required and must be non-empty"}
+        if not isinstance(properties, dict) or not properties:
+            return {"error": True, "code": "INVALID_INPUT", "message": "properties must be a non-empty dict"}
+        if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows < 1:
+            return {"error": True, "code": "INVALID_INPUT", "message": "max_rows must be at least 1"}
+        max_rows = min(max_rows, 500)
+        schema = await self._get_database_schema(database_id)
+        if schema.get("error"):
+            return schema
+        try:
+            raw_rows, truncated = await self._query_raw_rows(database_id, filter_obj, max_rows=max_rows)
+        except Exception as exc:
+            return {"error": True, "code": "QUERY_FAILED", "message": str(exc)}
+        if isinstance(raw_rows, dict) and raw_rows.get("error"):
+            return raw_rows
+        seen, duplicate_ids, rows = set(), [], []
+        for item in raw_rows:
+            row_id = item.get("id")
+            if row_id in seen:
+                duplicate_ids.append(row_id)
+                continue
+            seen.add(row_id)
+            rows.append(item)
+        results, errors = [], []
+        for item in rows:
+            row_id = item.get("id", "")
+            try:
+                page = await self.client.retrieve_page(row_id)
+                if page.get("error"):
+                    raise RuntimeError(page.get("message", "retrieve failed"))
+                before = self._page_fingerprint(page)
+                expected = (expected_fingerprints or {}).get(row_id)
+                if expected and expected != before:
+                    conflict = self._conflict("row changed since expected_fingerprint", expected, before)
+                    errors.append({"page_id": row_id, **conflict})
+                    continue
+                api_props = self._convert_row_properties(page.get("properties", {}), properties)
+                would_change = not self._properties_match(page, properties)
+                if dry_run:
+                    results.append({"page_id": row_id, "would_change": would_change,
+                                    "fingerprint": before})
+                    continue
+                # Re-read immediately before the PATCH; no stale overwrite.
+                guard_page = await self.client.retrieve_page(row_id)
+                guard_fp = self._page_fingerprint(guard_page)
+                if guard_fp != before:
+                    errors.append({"page_id": row_id, **self._conflict(
+                        "row changed during bulk update preparation", before, guard_fp)})
+                    continue
+                if would_change:
+                    response = await self.client.update_page_properties(row_id, api_props)
+                    if response.get("error"):
+                        raise RuntimeError(response.get("message", "update failed"))
+                after = await self.client.retrieve_page(row_id)
+                verified = self._properties_match(after, properties)
+                row_result = {"page_id": row_id, "changed": would_change,
+                              "verified": verified,
+                              "fingerprint": self._page_fingerprint(after)}
+                if not verified:
+                    row_result["error"] = True
+                    row_result["code"] = "VERIFY_FAILED"
+                    errors.append(row_result)
+                else:
+                    results.append(row_result)
+            except Exception as exc:
+                errors.append({"page_id": row_id, "error": True,
+                               "code": "UPDATE_FAILED", "message": str(exc)})
+        return {"database_id": database_id,
+                **self._metadata(operation, any(item.get("changed") for item in results),
+                                 True if not errors and not dry_run else (None if dry_run else False),
+                                 matched=len(rows), updated=sum(1 for item in results if item.get("changed")),
+                                 skipped=sum(1 for item in results if not item.get("changed")),
+                                 affected=len(results), max_rows=max_rows,
+                                 truncated=truncated, dry_run=dry_run,
+                                 duplicates=duplicate_ids, errors=errors,
+                                 results=results)}
+
+    def _supports_ordered_after(self) -> bool:
+        """Only use positional insertion when the client advertises proof."""
+        return bool(getattr(self.client, "supports_ordered_after", False))
+
+    @staticmethod
+    def _ordering_error(message: str) -> dict:
+        return {"error": True, "code": "ORDERING_UNPROVEN", "message": message}
+
+    def _prepare_nested_diff(self, existing_nodes: list, desired: list, path=()):
+        by_id = {str(node["block"].get("id")): node for node in existing_nodes
+                 if node.get("block", {}).get("id")}
+        by_anchor = {}
+        for node in existing_nodes:
+            by_anchor.setdefault(self._stable_anchor(node["block"]), []).append(node)
+        matches, used = [], set()
+        for index, want in enumerate(desired):
+            candidate = None
+            if isinstance(want, dict) and want.get("id") is not None:
+                candidate = by_id.get(str(want["id"]))
+            if candidate is None:
+                candidate = next((node for node in by_anchor.get(self._stable_anchor(want), [])
+                                  if node["block"].get("id") not in used), None)
+            matches.append(candidate)
+            if candidate and candidate["block"].get("id"):
+                used.add(candidate["block"]["id"])
+        retained = [node["block"].get("id") for node in matches if node]
+        existing_retained = [node["block"].get("id") for node in existing_nodes
+                             if node["block"].get("id") in used]
+        if retained != existing_retained:
+            return None, self._ordering_error(
+                f"requested block order at {list(path)} differs from provider order; no mutation was applied")
+        inserts = [i for i, node in enumerate(matches) if node is None]
+        if inserts and existing_nodes:
+            if not self._supports_ordered_after():
+                return None, self._ordering_error(
+                    "client does not prove sibling insertion ordering; refusing insertion/reordering")
+            if inserts[0] == 0 and any(node is not None for node in matches[1:]):
+                return None, self._ordering_error(
+                    "provider has no safe insert-before primitive for a new first child")
+        children = []
+        for index, (want, old) in enumerate(zip(desired, matches)):
+            if old is None:
+                continue
+            old_block = old["block"]
+            if old_block.get("type") != want.get("type"):
+                return None, {"error": True, "code": "BLOCK_TYPE_MISMATCH",
+                              "message": (f"block '{old_block.get('id')}' type cannot change from "
+                                          f"{old_block.get('type')} to {want.get('type')}")}
+            want_body = want.get(want.get("type"), {}) if isinstance(want, dict) else {}
+            want_children = want_body.get("children", []) if isinstance(want_body, dict) else []
+            child_plan, error = self._prepare_nested_diff(old.get("children", []), want_children,
+                                                          path + (index,))
+            if error:
+                return None, error
+            children.append((old_block.get("id"), child_plan))
+        return {"desired": desired, "matches": matches, "used": used,
+                "children": children,
+                "deletes": [node for node in existing_nodes
+                            if node["block"].get("id") not in used]}, None
+
+    async def _apply_nested_diff(self, parent_id: str, plan: dict) -> dict:
+        counts = {"matched": 0, "created": 0, "updated": 0, "deleted": 0}
+        result_ids = []
+        for want, old in zip(plan["desired"], plan["matches"]):
+            if old is not None:
+                old_id = old["block"].get("id")
+                result_ids.append(old_id)
+                counts["matched"] += 1
+                if self._stable_anchor(want) != self._stable_anchor(old["block"]):
+                    response = await self.client.update_block(old_id, self._writable_block(want))
+                    if response.get("error"):
+                        return {"error": True, "response": response, "counts": counts}
+                    counts["updated"] += 1
+            else:
+                after = result_ids[-1] if result_ids else None
+                payload = self._writable_block(want, include_children=True)
+                kwargs = {"after": after} if after is not None else {}
+                response = await self.client.append_block_children(parent_id, [payload], **kwargs)
+                if response.get("error"):
+                    return {"error": True, "response": response, "counts": counts}
+                made = response.get("results") or []
+                new_id = made[0].get("id") if made and isinstance(made[0], dict) else None
+                if not new_id:
+                    return {"error": True, "response": self._ordering_error(
+                        "provider did not return the inserted block ID; stopping before further mutation"),
+                            "counts": counts}
+                result_ids.append(new_id)
+                counts["created"] += 1
+        for old_id, child_plan in plan["children"]:
+            if child_plan:
+                result = await self._apply_nested_diff(old_id, child_plan)
+                if result.get("error"):
+                    return result
+                for key in counts:
+                    counts[key] += result["counts"].get(key, 0)
+        for old in plan["deletes"]:
+            response = await self.client.delete_block(old["block"].get("id"))
+            if response.get("error") and response.get("code") != "NOT_FOUND":
+                return {"error": True, "response": response, "counts": counts}
+            counts["deleted"] += 1
+        return {"counts": counts}
+
+    @classmethod
+    def _nested_tree_matches(cls, desired: list, actual_nodes: list) -> bool:
+        if len(desired) != len(actual_nodes):
+            return False
+        for want, node in zip(desired, actual_nodes):
+            got = node.get("block", {})
+            if cls._stable_anchor(want) != cls._stable_anchor(got):
+                return False
+            body = want.get(want.get("type"), {}) if isinstance(want, dict) else {}
+            want_children = body.get("children", []) if isinstance(body, dict) else []
+            if not cls._nested_tree_matches(want_children, node.get("children", [])):
+                return False
+        return True
+
+    async def replace_page_content(self, page_id: str, markdown: Optional[str] = None,
+                                   blocks: Optional[list] = None,
+                                   expected_fingerprint: Optional[str] = None,
+                                   idempotency_key: Optional[str] = None) -> dict:
+        """Replace the complete recursive child tree with preflighted ordering safety."""
+        operation = "notion_replace_page_content"
+        if (markdown is None) == (blocks is None):
+            return {"error": True, "code": "INVALID_INPUT",
+                    "message": "provide exactly one of markdown or blocks"}
+        request_fp = self._fingerprint({"page_id": page_id, "markdown": markdown, "blocks": blocks})
+        replay = self._idempotency_replay(operation, idempotency_key, request_fp)
+        if replay is not None:
+            return replay
+        try:
+            desired = self.converter.convert(markdown) if markdown is not None else blocks
+        except Exception as exc:
+            return {"error": True, "code": "PARSE_FAILED", "message": f"Failed to parse markdown: {exc}"}
+        if not isinstance(desired, list):
+            return {"error": True, "code": "INVALID_INPUT", "message": "blocks must be a list"}
+        missing = find_table_missing_children(desired)
+        if missing:
+            return {"error": True, "code": "INVALID_INPUT", "message": "table blocks must include inline children"}
+        try:
+            page = await self.client.retrieve_page(page_id)
+            initial_tree = await self._read_block_tree(page_id)
+            initial_fp = self._page_fingerprint(page, initial_tree)
+            if expected_fingerprint and expected_fingerprint != initial_fp:
+                return self._conflict("page changed since expected_fingerprint", expected_fingerprint, initial_fp)
+            current_page = await self.client.retrieve_page(page_id)
+            current_tree = await self._read_block_tree(page_id)
+        except Exception as exc:
+            return {"error": True, "code": "FETCH_FAILED", "message": str(exc)}
+        current_fp = self._page_fingerprint(current_page, current_tree)
+        if current_fp != initial_fp:
+            return self._conflict("page changed during replace preparation", initial_fp, current_fp)
+        plan, error = self._prepare_nested_diff(current_tree, desired)
+        if error:
+            return error
+        applied = await self._apply_nested_diff(page_id, plan)
+        if applied.get("error"):
+            response = applied.get("response") or {}
+            return response if response.get("error") else {"error": True, "code": "APPLY_FAILED",
+                                                               "message": "nested replacement stopped after a provider error"}
+        final_page = await self.client.retrieve_page(page_id)
+        final_tree = await self._read_block_tree(page_id)
+        counts = applied["counts"]
+        verified = self._nested_tree_matches(desired, final_tree)
+        result = {"page_id": page_id,
+                  **self._metadata(operation, any(counts[k] for k in ("created", "updated", "deleted")),
+                                   verified, **counts, total_blocks=len(_flatten_tree(desired)),
+                                   fingerprint=self._page_fingerprint(final_page, final_tree))}
+        if not verified:
+            result["explain"] = "final recursive page tree did not match the requested block sequence"
+        if idempotency_key:
+            result = self._remember_idempotency(operation, idempotency_key, request_fp, result)
+        self._audit(operation, result, page_id, request_fp)
+        return result
+
+
+    async def _bulk_process_row(self, row_id: str, properties: dict, dry_run: bool,
+                                expected_fingerprints: Optional[dict]) -> dict:
+        try:
+            page = await self.client.retrieve_page(row_id)
+            if page.get("error"):
+                raise RuntimeError(page.get("message", "retrieve failed"))
+            before = self._page_fingerprint(page)
+            expected = (expected_fingerprints or {}).get(row_id)
+            if expected and expected != before:
+                return {"page_id": row_id, **self._conflict("row changed since expected_fingerprint", expected, before)}
+            api_props = self._convert_row_properties(page.get("properties", {}), properties)
+            changed = not self._properties_match(page, properties)
+            if dry_run:
+                return {"page_id": row_id, "would_change": changed, "changed": False,
+                        "verified": None, "fingerprint": before}
+            guard = await self.client.retrieve_page(row_id)
+            guard_fp = self._page_fingerprint(guard)
+            if guard_fp != before:
+                return {"page_id": row_id, **self._conflict("row changed during bulk update preparation", before, guard_fp)}
+            if changed:
+                response = await self.client.update_page_properties(row_id, api_props)
+                if response.get("error"):
+                    raise RuntimeError(response.get("message", "update failed"))
+            after = await self.client.retrieve_page(row_id)
+            verified = self._properties_match(after, properties)
+            result = {"page_id": row_id, "changed": changed, "verified": verified,
+                      "fingerprint": self._page_fingerprint(after)}
+            if not verified:
+                result.update({"error": True, "code": "VERIFY_FAILED"})
+            return result
+        except Exception as exc:
+            return {"page_id": row_id, "error": True, "code": "UPDATE_FAILED", "message": str(exc)}
+
+    def _bulk_response(self, database_id: str, results: list, errors: list, matched: int,
+                       max_rows: int, dry_run: bool, truncated: bool,
+                       job_id: Optional[str] = None, status: Optional[str] = None,
+                       next_cursor: Optional[str] = None) -> dict:
+        result = {"database_id": database_id,
+                  **self._metadata("notion_bulk_update_rows",
+                                   any(item.get("changed") for item in results),
+                                   True if not errors and not dry_run else (None if dry_run else False),
+                                   matched=matched, affected=len(results),
+                                   updated=sum(1 for x in results if x.get("changed")),
+                                   skipped=sum(1 for x in results if not x.get("changed")),
+                                   max_rows=max_rows, truncated=truncated, dry_run=dry_run,
+                                   duplicates=[], errors=errors, results=results)}
+        if job_id:
+            result.update({"job_id": job_id, "status": status, "next_cursor": next_cursor})
+        return result
+
+    async def _run_resumable_bulk(self, database_id: str, filter_obj: dict,
+                                  properties: dict, dry_run: bool, max_rows: int,
+                                  expected_fingerprints: Optional[dict], job_id: Optional[str],
+                                  resume: bool, batch_size: int) -> dict:
+        request_hash = self._fingerprint({"database_id": database_id, "filter": filter_obj,
+                                           "properties": properties, "dry_run": dry_run})
+        job = self.state_store.get_job(job_id) if job_id else None
+        if job and job["request_hash"] != request_hash:
+            return self._conflict("bulk job was created with different input")
+        if not job:
+            if resume:
+                return {"error": True, "code": "NOT_FOUND", "message": f"bulk job '{job_id}' was not found"}
+            state = {"database_id": database_id, "filter_obj": filter_obj,
+                     "properties": properties, "dry_run": dry_run, "limit": max_rows,
+                     "cursor": None, "processed_ids": [], "results": [], "errors": [],
+                     "matched": 0, "status": "running"}
+            job = self.state_store.create_job(request_hash, state, job_id=job_id)
+        job_id = job["job_id"]
+        state = job["state"]
+        if state.get("status") == "completed":
+            return self._bulk_response(database_id, state["results"], state["errors"],
+                                       state["matched"], state["limit"], dry_run, False,
+                                       job_id, "completed", None)
+        page_size = max(1, min(int(batch_size), 100))
+        try:
+            while state["matched"] < state["limit"]:
+                kwargs = {"filter_obj": filter_obj, "page_size": page_size}
+                if state.get("cursor"):
+                    kwargs["start_cursor"] = state["cursor"]
+                response = await self.client.query_database(database_id, **kwargs)
+                if response.get("error"):
+                    state["status"] = "paused"
+                    self.state_store.update_job(job_id, state, job["version"])
+                    return self._bulk_response(database_id, state["results"], state["errors"],
+                                               state["matched"], state["limit"], dry_run, True,
+                                               job_id, "paused", state.get("cursor"))
+                rows = response.get("results", []) or []
+                if not rows:
+                    state["status"] = "completed"
+                    state["cursor"] = None
+                    break
+                for row in rows:
+                    if state["matched"] >= state["limit"]:
+                        break
+                    row_id = row.get("id", "")
+                    if row_id in state["processed_ids"]:
+                        continue
+                    item = await self._bulk_process_row(row_id, properties, dry_run,
+                                                        expected_fingerprints)
+                    state["matched"] += 1
+                    state["processed_ids"].append(row_id)
+                    (state["errors"] if item.get("error") else state["results"]).append(item)
+                    # Commit after every row. Replaying a row after a crash is
+                    # safe because the fresh guard sees the desired state.
+                    job = self.state_store.update_job(job_id, state, job["version"])
+                if state["matched"] >= state["limit"] or not response.get("has_more"):
+                    state["status"] = "completed"
+                    state["cursor"] = None
+                    break
+                state["cursor"] = response.get("next_cursor")
+                state["processed_ids"] = []
+                job = self.state_store.update_job(job_id, state, job["version"])
+            job = self.state_store.update_job(job_id, state, job["version"])
+        except StateConflict as exc:
+            return {"error": True, "code": "CONFLICT", "message": str(exc), "job_id": job_id}
+        except Exception as exc:
+            state["status"] = "paused"
+            try:
+                self.state_store.update_job(job_id, state, job["version"])
+            except Exception:
+                pass
+            return {"error": True, "code": "JOB_PAUSED", "message": str(exc), "job_id": job_id,
+                    "next_cursor": state.get("cursor")}
+        result = self._bulk_response(database_id, state["results"], state["errors"],
+                                     state["matched"], state["limit"], dry_run,
+                                     bool(state.get("cursor")), job_id, state["status"],
+                                     state.get("cursor"))
+        self._audit("notion_bulk_update_rows", result, database_id, request_hash)
+        return result
+
+    async def bulk_update_rows(self, database_id: str, filter_obj: Optional[dict],
+                               properties: dict, dry_run: bool = False, max_rows: int = 100,
+                               expected_fingerprints: Optional[dict] = None,
+                               job_id: Optional[str] = None, resume: bool = False,
+                               batch_size: int = 100) -> dict:
+        """Synchronous updates stay capped at 500; larger requests are jobs."""
+        if not isinstance(filter_obj, dict) or not filter_obj:
+            return {"error": True, "code": "INVALID_INPUT", "message": "filter_obj is required and must be non-empty"}
+        if not isinstance(properties, dict) or not properties:
+            return {"error": True, "code": "INVALID_INPUT", "message": "properties must be a non-empty dict"}
+        if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows < 1:
+            return {"error": True, "code": "INVALID_INPUT", "message": "max_rows must be at least 1"}
+        if job_id or max_rows > 500 or resume:
+            if max_rows > 100000:
+                return {"error": True, "code": "INVALID_INPUT", "message": "resumable max_rows cannot exceed 100000"}
+            return await self._run_resumable_bulk(database_id, filter_obj, properties, dry_run,
+                                                  max_rows, expected_fingerprints, job_id,
+                                                  resume, batch_size)
+        schema = await self._get_database_schema(database_id)
+        if schema.get("error"):
+            return schema
+        try:
+            raw_rows, truncated = await self._query_raw_rows(database_id, filter_obj, max_rows=min(max_rows, 500))
+        except Exception as exc:
+            return {"error": True, "code": "QUERY_FAILED", "message": str(exc)}
+        if isinstance(raw_rows, dict) and raw_rows.get("error"):
+            return raw_rows
+        seen, duplicate_ids, rows = set(), [], []
+        for item in raw_rows:
+            if item.get("id") in seen:
+                duplicate_ids.append(item.get("id"))
+            else:
+                seen.add(item.get("id")); rows.append(item)
+        results, errors = [], []
+        for item in rows:
+            item_result = await self._bulk_process_row(item.get("id", ""), properties, dry_run,
+                                                       expected_fingerprints)
+            (errors if item_result.get("error") else results).append(item_result)
+        result = self._bulk_response(database_id, results, errors, len(rows), min(max_rows, 500),
+                                     dry_run, truncated)
+        result["duplicates"] = duplicate_ids
+        self._audit("notion_bulk_update_rows", result, database_id)
+        return result
+
+    def get_bulk_job(self, job_id: str) -> dict:
+        job = self.state_store.get_job(job_id)
+        if not job:
+            return {"error": True, "code": "NOT_FOUND", "message": f"bulk job '{job_id}' was not found"}
+        state = job["state"]
+        return {"job_id": job_id, "status": state.get("status"), "version": job["version"],
+                "next_cursor": state.get("cursor"), "matched": state.get("matched", 0),
+                "updated": sum(1 for x in state.get("results", []) if x.get("changed")),
+                "errors": len(state.get("errors", []))}
+
+    async def resume_bulk_job(self, job_id: str) -> dict:
+        job = self.state_store.get_job(job_id)
+        if not job:
+            return {"error": True, "code": "NOT_FOUND", "message": f"bulk job '{job_id}' was not found"}
+        state = job["state"]
+        return await self.bulk_update_rows(state["database_id"], state["filter_obj"],
+                                           state["properties"], state.get("dry_run", False),
+                                           state.get("limit", 500), job_id=job_id, resume=True)
 
     async def update_page_properties(self, page_id: str, properties: dict) -> dict:
         """Update typed properties on an existing page.
@@ -500,7 +1427,9 @@ class WriteHandler:
         duration = int((time.monotonic() - start_time) * 1000)
         return {"page_id": result.get("id", page_id),
                 "updated": list(api_props.keys()),
-                "duration_ms": duration}
+                "duration_ms": duration,
+                "operation": "notion_update_page_properties",
+                "changed": True, "verified": None}
 
     async def archive_page(self, page_id: str, restore: bool = False,
                            object_type: str = "auto") -> dict:
@@ -525,7 +1454,9 @@ class WriteHandler:
         return {"object": object_kind,
                 "id": result.get("id", page_id),
                 "archived": archived,
-                "duration_ms": duration}
+                "duration_ms": duration,
+                "operation": "notion_archive_page",
+                "changed": True, "verified": None}
 
     async def move_page(self, page_id: str, parent_page_id: str) -> dict:
         """Move a page beneath another page and return the updated page response.
@@ -829,7 +1760,8 @@ class WriteHandler:
         if result.get("error"):
             return result
         duration = int((time.monotonic() - start_time) * 1000)
-        return {"block_id": block_id, "type": block_type, "duration_ms": duration}
+        return {"block_id": block_id, "type": block_type, "duration_ms": duration,
+                "operation": "notion_update_block", "changed": True, "verified": None}
 
     async def update_block_raw(self, block_id: str, block_data: List[Dict]) -> dict:
         """Update a block using raw block JSON. Supports all block types including
@@ -848,7 +1780,8 @@ class WriteHandler:
         if result.get("error"):
             return result
         duration = int((time.monotonic() - start_time) * 1000)
-        return {"block_id": block_id, "type": block_type, "duration_ms": duration}
+        return {"block_id": block_id, "type": block_type, "duration_ms": duration,
+                "operation": "notion_update_block", "changed": True, "verified": None}
 
     async def delete_block(self, block_id: str) -> dict:
         """Delete a block by ID. Also removes all child blocks recursively.
@@ -866,7 +1799,8 @@ class WriteHandler:
                 return {"deleted": block_id, "already_deleted": True, "duration_ms": 0}
             return result
         duration = int((time.monotonic() - start_time) * 1000)
-        return {"deleted": block_id, "duration_ms": duration}
+        return {"deleted": block_id, "duration_ms": duration,
+                "operation": "notion_delete_block", "changed": True, "verified": None}
 
     # --- Table row / table replacement (production rules 5 & 6) ---
 
