@@ -17,6 +17,11 @@ NOTION_VERSION = "2022-06-28"
 class NotionClient:
     """Async Notion API client with rate limiting and retry."""
 
+    # The 2022-06-28 children endpoint documents `after` as a sibling
+    # insertion primitive. Handlers require this explicit capability marker
+    # before attempting an insertion that depends on provider ordering.
+    supports_ordered_after = True
+
     def __init__(self, token: str):
         self.token = token
         self.rate_limiter = RateLimiter(max_rps=3)

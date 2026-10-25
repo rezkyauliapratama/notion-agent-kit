@@ -3,7 +3,7 @@
 import os
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -19,6 +19,7 @@ from handlers.read_handler import ReadHandler
 from handlers.user_handler import UserHandler
 from handlers.write_handler import WriteHandler
 from handlers.validate import extract_page_id, extract_user_id
+from core.state_store import SQLiteStateStore
 
 logger = logging.getLogger("notion-agent-kit")
 
@@ -37,10 +38,11 @@ _query_handler: Optional[QueryHandler] = None
 _read_handler: Optional[ReadHandler] = None
 _user_handler: Optional[UserHandler] = None
 _write_handler: Optional[WriteHandler] = None
+_state_store: Optional[SQLiteStateStore] = None
 
 
 def _ensure_init():
-    global _client, _cache, _converter, _batcher, _comment_handler, _file_handler, _find_handler, _query_handler, _read_handler, _user_handler, _write_handler
+    global _client, _cache, _converter, _batcher, _comment_handler, _file_handler, _find_handler, _query_handler, _read_handler, _user_handler, _write_handler, _state_store
     if _client is not None:
         return
 
@@ -61,7 +63,9 @@ def _ensure_init():
     _query_handler = QueryHandler(client=_client)
     _read_handler = ReadHandler(client=_client, max_depth=2)
     _user_handler = UserHandler(client=_client)
-    _write_handler = WriteHandler(client=_client, converter=_converter, batcher=_batcher, cache=_cache)
+    _state_store = SQLiteStateStore.from_env()
+    _write_handler = WriteHandler(client=_client, converter=_converter, batcher=_batcher,
+                                  cache=_cache, state_store=_state_store)
 
 
 def _resolve_page_id(value: str):
@@ -371,6 +375,97 @@ async def notion_add_database_row(database_id: str, properties: dict) -> dict:
     if err:
         return err
     return await _write_handler.add_database_row(database_id, properties)
+
+
+@mcp.tool()
+async def notion_upsert_database_row(database_id: str, unique_key: str,
+                                     unique_value: Any = None,
+                                     properties: Optional[dict] = None,
+                                     filter_obj: Optional[dict] = None,
+                                     expected_fingerprint: Optional[str] = None,
+                                     idempotency_key: Optional[str] = None) -> dict:
+    """Create or update exactly one database row.
+
+    `unique_key` + `unique_value` build a type-aware exact filter; pass
+    `filter_obj` to use a raw Notion filter. Multiple matches return CONFLICT.
+    The operation reads before and immediately before update, returns a state
+    fingerprint, verifies the read-back, and safely re-queries after an
+    ambiguous create failure. `idempotency_key` is process-local only.
+    """
+    _ensure_init()
+    database_id, err = _resolve_page_id(database_id)
+    if err:
+        return err
+    assert database_id is not None
+    assert _write_handler is not None
+    return await _write_handler.upsert_database_row(
+        database_id, unique_key, unique_value, properties, filter_obj,
+        expected_fingerprint, idempotency_key)
+
+
+@mcp.tool()
+async def notion_replace_page_content(page_id: str, markdown: Optional[str] = None,
+                                      blocks: Optional[list] = None,
+                                      expected_fingerprint: Optional[str] = None,
+                                      idempotency_key: Optional[str] = None) -> dict:
+    """Replace page children using read/diff/apply semantics.
+
+    Use either markdown or raw blocks. Existing raw block IDs are stable
+    anchors; unchanged exact-content blocks are retained. The tool updates,
+    appends, and deletes with a second read before mutation and verifies final
+    content. It refuses unsafe positional first-block insertion/reordering.
+    """
+    _ensure_init()
+    page_id, err = _resolve_page_id(page_id)
+    if err:
+        return err
+    assert page_id is not None
+    assert _write_handler is not None
+    return await _write_handler.replace_page_content(
+        page_id, markdown=markdown, blocks=blocks,
+        expected_fingerprint=expected_fingerprint, idempotency_key=idempotency_key)
+
+
+@mcp.tool()
+async def notion_bulk_update_rows(database_id: str, filter_obj: dict,
+                                  properties: dict, dry_run: bool = False,
+                                  max_rows: int = 100,
+                                  expected_fingerprints: Optional[dict] = None,
+                                  job_id: Optional[str] = None,
+                                  resume: bool = False,
+                                  batch_size: int = 100) -> dict:
+    """Preview or update bounded rows selected by an explicit filter.
+
+    `dry_run=true` performs reads and returns a preview without PATCH calls.
+    The result reports affected, skipped, duplicate, and errored rows. Each
+    real update is guarded by a fresh fingerprint and read-back verification.
+    """
+    _ensure_init()
+    database_id, err = _resolve_page_id(database_id)
+    if err:
+        return err
+    assert database_id is not None
+    assert _write_handler is not None
+    return await _write_handler.bulk_update_rows(
+        database_id, filter_obj, properties, dry_run=dry_run,
+        max_rows=max_rows, expected_fingerprints=expected_fingerprints,
+        job_id=job_id, resume=resume, batch_size=batch_size)
+
+
+@mcp.tool()
+async def notion_get_bulk_job(job_id: str) -> dict:
+    """Read durable status for a resumable bulk update job."""
+    _ensure_init()
+    assert _write_handler is not None
+    return _write_handler.get_bulk_job(job_id)
+
+
+@mcp.tool()
+async def notion_resume_bulk_update(job_id: str) -> dict:
+    """Resume a paused durable bulk update job from its last checkpoint."""
+    _ensure_init()
+    assert _write_handler is not None
+    return await _write_handler.resume_bulk_job(job_id)
 
 
 @mcp.tool()
