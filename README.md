@@ -16,15 +16,16 @@ Run the test suite:
 python -m unittest discover -s tests -v
 ```
 
-## Tools (29)
+## Tools (30)
 
 | Tool | Description |
 |------|-------------|
 | `notion_find` | Search pages/databases by title (`query`, `object_type`, `page_size`) |
-| `notion_read_page` | Read page content + metadata (`page_id`, `max_blocks` default 200, `depth`). Returns `has_more` when truncated — re-call with larger `max_blocks` (max 1000) to page through |
+| `notion_read_page` | Read page content + metadata (`page_id`, `max_blocks` default 200, `depth`, optional `start_cursor`). Continue with returned `next_cursor`; `has_more` is true only when a usable cursor confirms more blocks (max 1000 blocks per call); `pages_fetched` counts successful provider block-child pages used for the returned tree, including nested reads, and is not a provider total |
 | `notion_get_self` | Retrieve the user associated with the configured token. Returns allowlisted profile and bot workspace fields only; no token or raw credentials |
 | `notion_get_user` | Retrieve a workspace user, guest, or bot by `user_id` UUID (dashed or 32 hex only; page URLs are rejected) |
 | `notion_get_users` | List one page of workspace users (`page_size` 1–100, `start_cursor`); preserves `results`, `has_more`, and `next_cursor` |
+| `notion_get_block_children` | Read one bounded page of raw child blocks (`block_id`, `page_size` 1–100, optional `start_cursor`); continue with `next_cursor`; a valid response has `pages_fetched: 1` for this bounded provider page (not a provider total), and treat `READBACK_INCOMPLETE` as unverified rather than complete |
 | `notion_get_block_download_urls` | Get a fresh direct URL for an `image`, `file`, `video`, `pdf`, or `audio` block (`block_id`). Returns `urls: [{url, source, expiry_time?}]`; Notion-hosted `file` URLs are signed and should be refreshed after expiry |
 | `notion_upload_file` | Upload one local file (single-part, max 20 MiB) and attach it to a page/block as a `file_upload` media block (`file_path`, `target_id`, optional `target_type` and `mime_type`) |
 | `notion_create_comment` | Create a plain-text comment (`text`) on exactly one target: `page_id`, `block_id`, or `discussion_id` to reply to a thread |
