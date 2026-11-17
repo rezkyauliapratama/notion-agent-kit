@@ -103,15 +103,31 @@ async def notion_find(query: str, object_type: Optional[str] = None, page_size: 
 
 
 @mcp.tool()
-async def notion_read_page(page_id: str, max_blocks: int = 200, depth: int = 2) -> dict:
-    """Read a Notion page's content and metadata. Returns has_more=true when
-    max_blocks truncates the page; call again with a larger max_blocks (max 1000)
-    to page through the rest."""
+async def notion_read_page(page_id: str, max_blocks: int = 200, depth: int = 2,
+                          start_cursor: Optional[str] = None) -> dict:
+    """Read a page and up to max_blocks children (max 1000). Pass next_cursor
+    as start_cursor to continue; has_more requires a usable cursor. pages_fetched
+    counts successful block-child pages used for this tree, including nested reads;
+    it is not a provider-reported total."""
     _ensure_init()
     page_id, err = _resolve_page_id(page_id)
     if err:
         return err
-    return await _read_handler.read_page(page_id, max_blocks, depth)
+    return await _read_handler.read_page(page_id, max_blocks, depth, start_cursor)
+
+
+@mcp.tool()
+async def notion_get_block_children(block_id: str, page_size: int = 100,
+                                   start_cursor: Optional[str] = None) -> dict:
+    """Fetch one child-block page (page_size 1–100); pass next_cursor as
+    start_cursor to continue. A valid response reports pages_fetched=1 for this
+    provider page, not a provider-reported total. Unverified continuation returns
+    READBACK_INCOMPLETE."""
+    _ensure_init()
+    block_id, err = _resolve_page_id(block_id)
+    if err:
+        return err
+    return await _read_handler.get_block_children(block_id, page_size, start_cursor)
 
 
 @mcp.tool()
